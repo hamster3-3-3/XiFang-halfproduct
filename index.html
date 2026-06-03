@@ -1753,10 +1753,10 @@ function monthKeyFromRangeKey(rangeKey, fileName){
 function normalizeReasonKey(s){
   const t = normKey(s);
   if (!t) return '';
-  if (t.includes(normKey('展開量高於105%')) || t.includes(normKey('展開量高於１０5％')) || t.includes(normKey('展開量高於105％'))) return 'above105';
+  if (t.includes(normKey('展開量高於105%')) || t.includes(normKey('展開量高於１０5％')) || t.includes(normKey('展開量高於105％')) || t.includes(normKey('展開量高於需求量'))) return 'above105';
   if (t.includes(normKey('調理多產'))) return 'tooMuch';
   if (t.includes(normKey('製程不穩')) || t.includes(normKey('製程不穩定'))) return 'process';
-  if (t.includes(normKey('取樣不穩')) || t.includes(normKey('取樣不穩定'))) return 'sample';
+  if (t.includes(normKey('取樣不穩')) || t.includes(normKey('取樣不穩定')) || t.includes(normKey('抓樣不穩')) || t.includes(normKey('抓樣不穩定'))) return 'sample';
   if (t.includes(normKey('原物料規格'))) return 'raw';
   if (t.includes(normKey('研發設定'))) return 'rd';
   if (t.includes(normKey('其他原因'))) return 'other';
@@ -1765,12 +1765,37 @@ function normalizeReasonKey(s){
 }
 
 function parseTop20FromWB(wb, fileName){
-  const fileYear = (safeStr(fileName).match(/(20\d{2})/)||[])[1] || null;
-  const mFileRange = safeStr(fileName).match(/(\d{4})\s*[-~～]\s*(\d{4})/);
-  const fileRangeKey = mFileRange ? (mFileRange[1] + '-' + mFileRange[2]) : null;
-  const inferredMonthKey = fileRangeKey
-    ? monthKeyFromRangeKey(fileRangeKey, fileName)
-    : inferMonthKeyFromFileName(fileName);
+  const fileText = safeStr(fileName);
+  const fileYear = (fileText.match(/(20\d{2})/)||[])[1] || null;
+
+  function top20RangeKeyFromText(v){
+    const s0 = safeStr(v).trim();
+    if (!s0 || s0 === '月別') return null;
+    const s = s0.replace(/[～~—–－]/g, '-');
+
+    // 0512-0518 / 0512～0518
+    let m = s.match(/(\d{4})\s*[-]\s*(\d{4})/);
+    if (m) return `${m[1]}-${m[2]}`;
+
+    // 0512-18：end month follows start month
+    m = s.match(/(\d{4})\s*[-]\s*(\d{2})(?!\d)/);
+    if (m) return `${m[1]}-${m[1].slice(0,2)}${m[2]}`;
+
+    // 5/12-5/18 or 05/12~05/18
+    m = s.match(/(\d{1,2})\D+(\d{1,2})\D+(\d{1,2})\D+(\d{1,2})/);
+    if (m){
+      const a = String(Number(m[1])).padStart(2,'0') + String(Number(m[2])).padStart(2,'0');
+      const b = String(Number(m[3])).padStart(2,'0') + String(Number(m[4])).padStart(2,'0');
+      return `${a}-${b}`;
+    }
+
+    const dig = normDigits(s);
+    if (dig.length >= 8) return `${dig.slice(0,4)}-${dig.slice(4,8)}`;
+    if (dig.length === 6) return `${dig.slice(0,4)}-${dig.slice(0,2)}${dig.slice(4,6)}`;
+    return null;
+  }
+
+  const fileRangeKey = top20RangeKeyFromText(baseName(fileName)) || top20RangeKeyFromText(fileName);
 
   const out = [];
   for (const kind of ['scrap','over']){
@@ -1780,6 +1805,8 @@ function parseTop20FromWB(wb, fileName){
     const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
     if (!rows || !rows.length) continue;
 
+    // 新豐 JFM 的「報廢/超用20大－原因別分析」是一張累積表，B欄月別會以 0512-0518 這種格式切分週別。
+    // 因此不能把整張表都視為檔名代表的單週；必須逐列 carry-forward B欄區間。
     const headerRows = Math.min(8, rows.length);
     const maxC = Math.max(...rows.slice(0, headerRows).map(r => (r || []).length), 0);
     const colLabels = new Array(maxC).fill("");
@@ -1792,9 +1819,6 @@ function parseTop20FromWB(wb, fileName){
       colLabels[c] = parts.join("|");
     }
 
-    // 前二十大明細表的「商品名」與「半成品名」常為多層表頭或合併儲存格。
-    // 舊版用「名稱」作為半成品欄位的 fallback，容易抓到「商品名稱」欄，造成商品名/半成品名錯位。
-    // 這裡改用明確欄位辨識：商品欄不得包含半成品；半成品欄必須包含半成品。
     const findCol = (needList, excludeList=[])=>{
       let best = -1;
       let bestScore = -1;
@@ -1820,60 +1844,49 @@ function parseTop20FromWB(wb, fileName){
       return best;
     };
 
-    const findNearbyProductCol = (semiCol)=>{
-      if (semiCol == null || semiCol < 0) return -1;
-      // 常見版面為：排序｜商品名｜半成品名｜單價｜金額...
-      const candidates = [semiCol-1, semiCol-2, semiCol+1, semiCol+2];
-      for (const c of candidates){
-        if (c < 0 || c >= colLabels.length) continue;
-        const h = normKey(colLabels[c]);
-        if (!h) continue;
-        if ((h.includes(normKey('商品名')) || h.includes(normKey('商品名稱')) || h.includes(normKey('商品'))) && !h.includes(normKey('半成品'))) return c;
-      }
-      return -1;
-    };
-
+    const cMonth    = findCol(['月別']);
     const cSort     = findCol(['排序','排名','序號']);
     const cSemiName = findCol(['半成品名稱','半成品名','半成品'], ['商品']);
-    let cProduct    = findCol(['備註商品名稱','備註-商品名稱','備註商品名','商品名稱','商品名','商品'], ['半成品','分析原因','原因說明','後續對策','單價','金額','排序','排名','序號']);
-    if (cProduct < 0) cProduct = findNearbyProductCol(cSemiName);
+    let cProduct    = findCol(['備註商品名稱','備註-商品名稱','備註商品名','商品名稱','商品名','商品'], ['半成品','分析原因','分析原因件','原因說明','後續對策','單價','金額','排序','排名','序號']);
 
     const cAmt      = (kind==='scrap') ? findCol(['報廢金額']) : findCol(['超用金額']);
     const cUnit     = findCol(['單價']);
-    const cReason   = findCol(['分析原因','原因別','原因分類']);
+    // 避免誤抓「分析原因（件）」統計欄，優先抓文字型的「分析原因」欄。
+    let cReason     = findCol(['分析原因'], ['分析原因件','總件數']);
+    if (cReason < 0) cReason = findCol(['原因別','原因分類']);
     const cDesc     = findCol(['原因說明']);
     const cAct      = findCol(['後續對策','對策']);
 
-    // 由「排序」欄後第一列開始掃描；若找不到排序欄，保留原本第 6 列開始的邏輯。
-    const dataStart = Math.min(rows.length, Math.max(6, headerRows));
-    for (let r=dataStart; r<rows.length; r++){
+    let lastRangeKey = null;
+    for (let r=0; r<rows.length; r++){
       const row = rows[r] || [];
+      const rawRange = cMonth >= 0 ? row[cMonth] : null;
+      const rowRangeKey = top20RangeKeyFromText(rawRange);
+      if (rowRangeKey) lastRangeKey = rowRangeKey;
+      const rangeKey = rowRangeKey || lastRangeKey || fileRangeKey || null;
+
       const sortVal = (cSort>=0) ? asNumber(row[cSort]) : NaN;
+      if (!(Number.isFinite(sortVal) && sortVal >= 1 && sortVal <= 20)) continue;
+
       const semi = (cSemiName>=0) ? safeStr(row[cSemiName]).trim() : '';
       const productRaw = (cProduct>=0) ? safeStr(row[cProduct]).trim() : '';
       const reason = (cReason>=0) ? safeStr(row[cReason]).trim() : '';
       const desc = (cDesc>=0) ? safeStr(row[cDesc]).trim() : '';
       const act  = (cAct>=0) ? safeStr(row[cAct]).trim() : '';
 
-      if (!(Number.isFinite(sortVal) && sortVal >= 1 && sortVal <= 20)) continue;
       if (!semi && !productRaw && !reason && !desc && !act) continue;
 
       const amt = (cAmt>=0) ? asNumber(row[cAmt]) : NaN;
       const unitPrice = (cUnit>=0) ? asNumber(row[cUnit]) : NaN;
 
-      // 商品名不可再 fallback 成半成品名，否則會造成畫面看起來「商品/半成品對不上」。
-      // 若來源表沒有商品名，先留空，後續 render 時會用半成品展開資料輔助補正。
-      const product = productRaw || '';
-      const semiName = semi || '';
-
       out.push({
         kind,
-        rangeKey: fileRangeKey || null,
-        monthKey: inferredMonthKey || null,
+        rangeKey,
+        monthKey: rangeKey ? monthKeyFromRangeKey(rangeKey, fileName) : inferMonthKeyFromFileName(fileName),
         reason,
         reasonKey: normalizeReasonKey(reason),
-        product,
-        semi: semiName,
+        product: productRaw || '',
+        semi: semi || '',
         unitPrice: Number.isFinite(unitPrice) ? unitPrice : null,
         amt: Number.isFinite(amt) ? amt : 0,
         desc,
@@ -2595,7 +2608,7 @@ function parseDetailsFromWB(wb, fileNameOrMeta) {
 // - 以 (週起-週迄, 原因) 作為 key
 // =========================
 const REASON_DEFS = [
-  { key:'above105',   label:'展開量高於105%',  tokens:['展開量高於105','展開量高於１０5','展開量高於105%','展開量高於105％'] },
+  { key:'above105',   label:'展開量高於105%',  tokens:['展開量高於105','展開量高於１０5','展開量高於105%','展開量高於105％','展開量高於需求量'] },
   { key:'tooMuch',    label:'調理多產',        tokens:['調理多產'] },
   { key:'process',    label:'製程不穩',        tokens:['製程不穩','製程不穩定'] },
   { key:'sample',     label:'取樣不穩',        tokens:['取樣不穩','取樣不穩定'] },
@@ -5713,7 +5726,9 @@ function renderTop20Expand(){
   } else if (monthKey){
     rows = rows.filter(r => (r.monthKey===monthKey) || (r.rangeKey && rangeKeyTouchesMonth(r.rangeKey, monthKey)));
   }
-  if (!rows.length && act.length) rows = rowsBeforePeriodFilter;
+  // 若來源表本身有週別 rangeKey，週別不吻合時不要退回顯示整張累積表，避免一週顯示多週資料。
+  const hasExplicitRange = rowsBeforePeriodFilter.some(r => !!r.rangeKey);
+  if (!rows.length && act.length && !hasExplicitRange) rows = rowsBeforePeriodFilter;
 
   const scopeMonthKey = (state.selection && state.selection.year && state.selection.month) ? `${state.selection.year}-${String(state.selection.month).padStart(2,'0')}` : null;
   const dupCount = makeTop20DupCountBefore(kind, st.cutoffStartISO, scopeMonthKey);
