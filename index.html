@@ -683,6 +683,7 @@ function monthKeyFromISO(iso){
               <option value="overuseAmt">超用金額（高→低）</option>
               <option value="overuseRate">超用率（高→低）</option>
               <option value="refillQty">補單量（高→低）</option>
+              <option value="refillRateNew">補單率（高→低）</option>
             </select>
           </div>
         </div>
@@ -747,6 +748,7 @@ function monthKeyFromISO(iso){
                 <button class="seg-btn" type="button" data-item-single="overuseAmt">超用金額</button>
                 <button class="seg-btn" type="button" data-item-single="overuseRate">超用率</button>
                 <button class="seg-btn" type="button" data-item-single="refillQty">補單量</button>
+                <button class="seg-btn" type="button" data-item-single="refillRateNew">補單率</button>
                 <button class="seg-btn" type="button" id="itemOrderOverlayBtn">訂單需求(副Y軸)</button>
               </div>
             </div>
@@ -812,6 +814,7 @@ const state = {
   loaded: false,
   summary: [],
   details: [],
+  halfDetails: [],
   dateMin: null,
   dateMax: null,
   years: [],
@@ -1997,6 +2000,230 @@ function escapeHTML(s){
   return String(s||'').replace(/[&<>"']/g, (m)=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
 }
 
+
+function parseLocalFileYearHint(fileNameOrMeta){
+  const s = (typeof fileNameOrMeta === 'string' ? fileNameOrMeta : (fileNameOrMeta?.name || '')) + '';
+  let m = s.match(/(20\d{2})\/(0?[1-9]|1[0-2])\//);
+  if (m) return Number(m[1]);
+  m = s.match(/(20\d{2})-(\d{2})(\d{2})-/);
+  if (m) return Number(m[1]);
+  m = s.match(/(?:^|[^\d])(1\d{2})[.\-_/](\d{1,2})[.\-_/](\d{1,2})/);
+  if (m) return 1911 + Number(m[1]);
+  m = s.match(/(20\d{2})/);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function parseDateWithYearHint(v, yearHint){
+  if (v == null || v === '') return null;
+  if (v instanceof Date && !isNaN(v)) return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+  if (typeof v === 'number' && isFinite(v)) {
+    try {
+      const dc = XLSX.SSF.parse_date_code(v);
+      if (dc && dc.y && dc.m && dc.d) return new Date(dc.y, dc.m - 1, dc.d);
+    } catch (_) {}
+  }
+  const s = String(v).trim();
+  if (!s) return null;
+  let m = s.match(/^(20\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (m) return new Date(Number(m[1]), Number(m[2])-1, Number(m[3]));
+  m = s.match(/^(1\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
+  if (m) return new Date(1911 + Number(m[1]), Number(m[2])-1, Number(m[3]));
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+  if (m && yearHint) return new Date(Number(yearHint), Number(m[1])-1, Number(m[2]));
+  const d = parseMaybeDate(s);
+  if (d instanceof Date && !isNaN(d)) return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return null;
+}
+
+function findNewHeaderRow(aoa){
+  const scanMax = Math.min((aoa||[]).length, 30);
+  for (let i=0; i<scanMax; i++){
+    const row = aoa[i] || [];
+    const rowStr = row.map(c => normalizeHeader(c)).join('|');
+    const hasDate = rowStr.includes('資料登錄日') || rowStr.includes('日期') || rowStr.includes('登錄日');
+    const hasProduct = rowStr.includes('商品名稱') || rowStr.includes('商品名') || rowStr.includes('品名');
+    const hasSemi = rowStr.includes('半成品名稱') || rowStr.includes('半成品名') || rowStr.includes('半成品');
+    const hasOrder = rowStr.includes('訂單需求') || rowStr.includes('訂單量') || rowStr.includes('訂單');
+    const hasOutput = rowStr.includes('總產出') || rowStr.includes('出料量') || rowStr.includes('實際產出');
+    if (hasDate && hasProduct && hasSemi && hasOrder && hasOutput) return i;
+  }
+  return -1;
+}
+
+function parseHalfDetailsFromWB(wb, fileName){
+  // 2026/05 以後的新格式常改為「半成品生產管理日報」與「xx合計」分頁；
+  // 這裡用更彈性的表頭定位補強半成品展開、日別明細與 KPI 派生計算。
+  const out = [];
+  const yearHint = parseLocalFileYearHint(fileName);
+  const sheetNames = (wb.SheetNames || []).map(s => String(s || ''));
+  const sumSheets = sheetNames.filter(s => {
+    const n = s.replace(/\s+/g,'');
+    if (!n.includes('合計') && !n.includes('分析日報')) return false;
+    if (/各日合計|日別報廢率總表|報廢率總表|前10名|共用類|KPI|名詞定義|下拉式選單|空白/i.test(n)) return false;
+    return true;
+  });
+
+  const findColBy = (labels, predicate) => {
+    for (let i=0; i<labels.length; i++){
+      const h = labels[i] || '';
+      if (predicate(h)) return i;
+    }
+    return -1;
+  };
+  const numOrNull = (v) => {
+    const n = asNumber(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const rateOrNull = (v) => {
+    const n = normalizeExcelRate(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  for (const sname of sumSheets){
+    const ws = wb.Sheets[sname];
+    if (!ws) continue;
+    const aoa = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null});
+    if (!aoa || aoa.length < 2) continue;
+
+    let hRow = findNewHeaderRow(aoa);
+    if (hRow < 0) {
+      const scanMax = Math.min(aoa.length, 30);
+      for (let i=0; i<scanMax; i++){
+        const rowStr = (aoa[i] || []).map(c => normalizeHeader(c)).join('|');
+        const hasProd = /商品(名|名稱)?|品名/.test(rowStr);
+        const hasSemi = /半成品(名|名稱)?|半成品/.test(rowStr);
+        const hasMetric = /訂單|需求|總產出|出料|實際|差異|報廢|超用|單價/.test(rowStr);
+        if (hasProd && hasSemi && hasMetric) { hRow = i; break; }
+      }
+    }
+    if (hRow < 0) continue;
+
+    const h1 = aoa[hRow] || [];
+    const h2 = aoa[hRow+1] || [];
+    const h2Text = h2.map(c => normalizeHeader(c)).join('|');
+    const twoLayer = /(^|\|)(kg|%|％|元)(\||$)/i.test(h2Text) || (h2Text.includes('kg') && (h2Text.includes('%') || h2Text.includes('元')));
+    const dataStart = hRow + (twoLayer ? 2 : 1);
+    const maxLen = Math.max(h1.length, twoLayer ? h2.length : 0);
+    const labels = [];
+    let carryTop = '';
+    for (let j=0; j<maxLen; j++){
+      const rawTop = normalizeHeader(h1[j]);
+      if (rawTop) carryTop = rawTop;
+      const top = rawTop || carryTop;
+      const sub = twoLayer ? normalizeHeader(h2[j]) : '';
+      labels[j] = (top + '|' + sub).replace(/\|$/,'');
+    }
+
+    const has = (h, ...tokens) => tokens.every(t => h.includes(normalizeHeader(t)));
+    const cDate = findColBy(labels, h => has(h,'資料登錄日') || has(h,'登錄日') || has(h,'日期') || has(h,'日別'));
+    const cProduct = findColBy(labels, h => (has(h,'商品名稱') || has(h,'商品名') || has(h,'品名') || has(h,'商品')) && !has(h,'半成品'));
+    const cSemi = findColBy(labels, h => has(h,'半成品名稱') || has(h,'半成品名') || has(h,'半成品'));
+    const cUnitPrice = findColBy(labels, h => has(h,'單價') || has(h,'價格'));
+    const cOrder = findColBy(labels, h => has(h,'訂單需求') || has(h,'訂單量') || has(h,'訂單'));
+
+    const cExpandQty = findColBy(labels, h => has(h,'生管展開') && (has(h,'kg') || has(h,'量')));
+    const cExpandRate = findColBy(labels, h => has(h,'生管展開') && (has(h,'%') || has(h,'％') || has(h,'率')));
+    const cActualQty = findColBy(labels, h => has(h,'生產實際產出') && (has(h,'kg') || has(h,'量')));
+    const cActualRate = findColBy(labels, h => has(h,'生產實際產出') && (has(h,'%') || has(h,'％') || has(h,'率')));
+    const cRefillQtyNew = findColBy(labels, h => (has(h,'生產補單') || has(h,'補單')) && (has(h,'kg') || has(h,'量')));
+    const cRefillRateNew = findColBy(labels, h => (has(h,'生產補單') || has(h,'補單')) && (has(h,'%') || has(h,'％') || has(h,'率')));
+    const cOutput = findColBy(labels, h => (has(h,'總產出') || has(h,'出料量') || has(h,'實際產出')) && (has(h,'kg') || has(h,'量') || !twoLayer));
+    const cOutputRate = findColBy(labels, h => (has(h,'總產出') || has(h,'實際產出率')) && (has(h,'%') || has(h,'％') || has(h,'率')));
+
+    const cDiffQty = findColBy(labels, h => has(h,'差異') && has(h,'量') && !has(h,'金額') && !has(h,'額'));
+    const cDiffAmt = findColBy(labels, h => has(h,'差異') && (has(h,'金額') || has(h,'元') || has(h,'額')));
+    const cScrapQty = findColBy(labels, h => has(h,'報廢') && (has(h,'kg') || has(h,'量')) && !has(h,'金額'));
+    const cScrapRate = findColBy(labels, h => has(h,'報廢') && (has(h,'%') || has(h,'％') || has(h,'率')));
+    const cScrapAmt = findColBy(labels, h => has(h,'報廢') && (has(h,'金額') || has(h,'元') || has(h,'額')));
+    const cOveruseQty = findColBy(labels, h => has(h,'超用') && (has(h,'kg') || has(h,'量')) && !has(h,'金額'));
+    const cOveruseRate = findColBy(labels, h => has(h,'超用') && (has(h,'%') || has(h,'％') || has(h,'率')));
+    const cOveruseAmt = findColBy(labels, h => has(h,'超用') && (has(h,'金額') || has(h,'元') || has(h,'額')));
+
+    if (cProduct < 0 || cSemi < 0) continue;
+
+    const hasNewColumns = [cExpandQty,cExpandRate,cActualQty,cActualRate,cRefillQtyNew,cRefillRateNew,cOutputRate,cScrapRate,cOveruseRate].some(c => c >= 0);
+
+    for (let r=dataStart; r<aoa.length; r++){
+      const row = aoa[r] || [];
+      const dt = parseDateWithYearHint(cDate >= 0 ? row[cDate] : row[0], yearHint) || parseDateWithYearHint(row[0], yearHint);
+      if (!dt) continue;
+      const date = toISO(dt);
+      const product = safeStr(row[cProduct]).trim();
+      const semi = safeStr(row[cSemi]).trim();
+      if (!product && !semi) continue;
+
+      const order = numOrNull(row[cOrder]) ?? 0;
+      const output = numOrNull(row[cOutput]) ?? 0;
+      const unitPrice = numOrNull(row[cUnitPrice]);
+      const expandQty = numOrNull(row[cExpandQty]);
+      let expandRate = rateOrNull(row[cExpandRate]);
+      const actualQty = numOrNull(row[cActualQty]);
+      let actualRate = rateOrNull(row[cActualRate]);
+      const refillQtyNew = numOrNull(row[cRefillQtyNew]);
+      let refillRateNew = rateOrNull(row[cRefillRateNew]);
+      let prodRate = rateOrNull(row[cOutputRate]);
+      const diffQty = numOrNull(row[cDiffQty]);
+      const diffAmt = numOrNull(row[cDiffAmt]);
+      const scrapQty = numOrNull(row[cScrapQty]);
+      let scrapRate = rateOrNull(row[cScrapRate]);
+      const scrapAmt = numOrNull(row[cScrapAmt]);
+      const overuseQtyRaw = numOrNull(row[cOveruseQty]);
+      let overuseRate = rateOrNull(row[cOveruseRate]);
+      const overuseAmt = numOrNull(row[cOveruseAmt]);
+
+      if (!Number.isFinite(prodRate) && order > 0 && Number.isFinite(output)) prodRate = output / order;
+      if (!Number.isFinite(expandRate) && order > 0 && Number.isFinite(expandQty)) expandRate = expandQty / order;
+      if (!Number.isFinite(actualRate) && order > 0 && Number.isFinite(actualQty)) actualRate = actualQty / order;
+      if (!Number.isFinite(refillRateNew) && order > 0 && Number.isFinite(refillQtyNew)) refillRateNew = refillQtyNew / order;
+      if (!Number.isFinite(scrapRate) && order > 0 && Number.isFinite(scrapQty)) scrapRate = scrapQty / order;
+      if (!Number.isFinite(overuseRate) && order > 0 && Number.isFinite(overuseQtyRaw)) overuseRate = overuseQtyRaw / order;
+      const overuseQty = Number.isFinite(overuseQtyRaw) ? overuseQtyRaw : ((Number.isFinite(unitPrice) && unitPrice > 0 && Number.isFinite(overuseAmt)) ? overuseAmt / unitPrice : null);
+      const refillAlias = Number.isFinite(refillQtyNew) ? refillQtyNew : 0;
+      const isNewDetail = hasNewColumns || date >= '2026-05-01' || /生產管理日報/.test(safeStr(fileName));
+
+      out.push({
+        date,
+        product,
+        semi,
+        unitPrice: Number.isFinite(unitPrice) ? unitPrice : null,
+        price: Number.isFinite(unitPrice) ? unitPrice : null,
+        order,
+        output,
+        outQty: output,
+        refill: refillAlias,
+        refillQty: refillAlias,
+        prodRate: Number.isFinite(prodRate) ? prodRate : null,
+        diffQty: Number.isFinite(diffQty) ? diffQty : null,
+        diffAmt: Number.isFinite(diffAmt) ? diffAmt : null,
+        scrapQty: Number.isFinite(scrapQty) ? scrapQty : null,
+        scrapRate: Number.isFinite(scrapRate) ? scrapRate : null,
+        scrapAmt: Number.isFinite(scrapAmt) ? scrapAmt : null,
+        overuseQty: Number.isFinite(overuseQty) ? overuseQty : null,
+        overuseRate: Number.isFinite(overuseRate) ? overuseRate : null,
+        overuseAmt: Number.isFinite(overuseAmt) ? overuseAmt : null,
+        expandQty: Number.isFinite(expandQty) ? expandQty : null,
+        expandRate: Number.isFinite(expandRate) ? expandRate : null,
+        actualQty: Number.isFinite(actualQty) ? actualQty : null,
+        actualRate: Number.isFinite(actualRate) ? actualRate : null,
+        refillQtyNew: Number.isFinite(refillQtyNew) ? refillQtyNew : refillAlias,
+        refillRateNew: Number.isFinite(refillRateNew) ? refillRateNew : (order > 0 ? refillAlias / order : null),
+        _detailFormat: isNewDetail ? 'new' : 'old'
+      });
+    }
+  }
+
+  const seen = new Set();
+  const dedup = [];
+  for (const r of out){
+    const k = [r.date, r.product, r.semi, r.order, r.output, r.scrapQty, r.scrapAmt, r.overuseQty, r.overuseAmt, r._detailFormat].join('|');
+    if (seen.has(k)) continue;
+    seen.add(k);
+    dedup.push(r);
+  }
+  return dedup;
+}
+
 function parseDetailsFromWB(wb, fileNameOrMeta) {
   const out = [];
 
@@ -2072,16 +2299,7 @@ function parseDetailsFromWB(wb, fileNameOrMeta) {
     const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null, raw: true });
     if (!aoa || !aoa.length) return [];
 
-    let hRow = -1;
-    const scanMax = Math.min(aoa.length, 20);
-    for (let i = 0; i < scanMax; i++) {
-      const row = aoa[i] || [];
-      const rowStr = row.map(c => norm(c)).join('|');
-      if (rowStr.includes('資料登錄日') && rowStr.includes('商品名稱') && rowStr.includes('半成品名稱') && rowStr.includes('訂單需求') && rowStr.includes('總產出')) {
-        hRow = i;
-        break;
-      }
-    }
+    const hRow = findNewHeaderRow(aoa);
     if (hRow < 0 || hRow + 1 >= aoa.length) return [];
 
     const h1 = aoa[hRow] || [];
@@ -2274,7 +2492,7 @@ function parseDetailsFromWB(wb, fileNameOrMeta) {
       const h = norm(header[j]);
       if (!h) continue;
 
-      if (idx.date == null && /(日期|生產日|出貨日|日別|製造日|製造日期)/.test(h)) idx.date = j;
+      if (idx.date == null && /(資料登錄日|登錄日|日期|生產日|出貨日|日別|製造日|製造日期)/.test(h)) idx.date = j;
       if (idx.product == null && /(商品名|商品名稱|品名|商品)$/.test(h)) idx.product = j;
       if (idx.product == null && h.includes('商品') && h.includes('名')) idx.product = j;
       if (idx.semi == null && /(半成品名|半成品名稱|半成品|共用類|半成品類)/.test(h)) idx.semi = j;
@@ -2880,6 +3098,13 @@ function dedupeLoadedData(){
   state.summary = Array.from(sm.values()).sort((a,b)=>safeLocaleCompare(a.date,b.date));
 
   state.details = (state.details||[]).sort((a,b)=>safeLocaleCompare(a.date,b.date));
+  const hm = new Map();
+  for (const r of (state.halfDetails||[])) {
+    if (!r || !r.date) continue;
+    const k = [r.date, r.product, r.semi, r.order, r.output, r.scrapQty, r.scrapAmt, r.overuseQty, r.overuseAmt, r._detailFormat].join('|');
+    hm.set(k, r);
+  }
+  state.halfDetails = Array.from(hm.values()).sort((a,b)=>safeLocaleCompare(a.date,b.date));
 
   const rm = new Map();
   for (const r of (state.reasonWeeks||[])) {
@@ -2907,6 +3132,7 @@ async function ensureDataForMonthKeys(monthKeys){
   const loadErrors = [];
   let sum = [];
   let det = [];
+  let halfDet = [];
   let reasons = [];
   let top20 = [];
 
@@ -2920,6 +3146,7 @@ async function ensureDataForMonthKeys(monthKeys){
         const wb = XLSX.read(ab, {type:'array', cellDates:true});
         sum = sum.concat(parseSummaryFromWB(wb, f));
         det = det.concat(parseDetailsFromWB(wb, f));
+        halfDet = halfDet.concat(parseHalfDetailsFromWB(wb, f));
       } else if (isJfmFile(f)) {
         const r = await fetchWithTimeout(url, {cache:'no-store'}, 20000);
         if (!r.ok) throw new Error('讀取失敗：' + f);
@@ -2936,11 +3163,12 @@ async function ensureDataForMonthKeys(monthKeys){
 
   state.summary = (state.summary || []).concat(sum);
   state.details = (state.details || []).concat(det);
+  state.halfDetails = (state.halfDetails || []).concat(halfDet);
   state.reasonWeeks = (state.reasonWeeks || []).concat(reasons);
   state.top20Entries = (state.top20Entries || []).concat(top20);
   dedupeLoadedData();
 
-  if (!state.summary.length) throw new Error('未解析到日別報廢率總表資料');
+  if (!state.summary.length && !state.details.length && !state.halfDetails.length) throw new Error('未解析到日別報廢率總表或半成品明細資料');
   need.forEach(mk => state.loadedMonthKeys.add(mk));
   state.loadErrors = Array.from(new Set((state.loadErrors || []).concat(loadErrors)));
 
@@ -2985,6 +3213,7 @@ async function loadAllData() {
   state.loadErrors = [];
   state.summary = [];
   state.details = [];
+  state.halfDetails = [];
   state.reasonWeeks = [];
   state.top20Entries = [];
   state.loadedMonthKeys = new Set();
@@ -3997,7 +4226,7 @@ function fmtMayGroupCell(row, col){
 }
 
 function buildGroupHeaderHTML(){
-  const isNew = isMay2026OrLaterRange();
+  const isNew = isMay2026OrLaterRange() || !!state._forceMayGroupLayout;
   if (isNew) {
     const cols = getMayGroupColumns();
     return `
@@ -4023,7 +4252,7 @@ function buildGroupHeaderHTML(){
 }
 
 function syncMayGroupColumnsAndSort(){
-  const isNew = isMay2026OrLaterRange();
+  const isNew = isMay2026OrLaterRange() || !!state._forceMayGroupLayout;
   state._useMayGroupLayout = isNew;
   state._hideGroupDiffColumns = isNew;
 
@@ -4036,7 +4265,7 @@ function syncMayGroupColumnsAndSort(){
       opt.style.display = isNew ? 'none' : '';
     });
 
-    const newOptions = sel.querySelectorAll('option[value="expandRate"], option[value="actualRate"]');
+    const newOptions = sel.querySelectorAll('option[value="expandRate"], option[value="actualRate"], option[value="refillRateNew"]');
     newOptions.forEach(opt => {
       opt.disabled = !isNew;
       opt.hidden = !isNew;
@@ -4049,7 +4278,7 @@ function syncMayGroupColumnsAndSort(){
     if (isNew && (sel.value === 'diffAmt' || sel.value === 'diffRate')) {
       sel.value = 'prodRate';
     }
-    if (!isNew && (sel.value === 'expandRate' || sel.value === 'actualRate')) {
+    if (!isNew && (sel.value === 'expandRate' || sel.value === 'actualRate' || sel.value === 'refillRateNew')) {
       sel.value = 'prodRate';
     }
   }
@@ -4073,6 +4302,7 @@ function syncGroupQtyRateHeaders(){
 }
 
 function applyGroupFilterAndRender(drows) {
+  state._forceMayGroupLayout = isMay2026OrLaterRange() || (Array.isArray(drows) && drows.some(r => safeStr(r.date) >= '2026-05-01'));
   const rangeKey = state.selection.start + '|' + state.selection.end;
   if (state._groupRangeKey !== rangeKey) {
     state.groupRows = aggregateGroups(drows);
@@ -4115,6 +4345,7 @@ function applyGroupFilterAndRender(drows) {
   if (sort === 'overuseAmt') filtered.sort(by('overuseAmt'));
   if (sort === 'overuseRate') filtered.sort(byNullable('overuseRate'));
   if (sort === 'refillQty') filtered.sort(isNewLayout ? by('refillQtyNew') : by('refillQty'));
+  if (sort === 'refillRateNew') filtered.sort(byNullable('refillRateNew'));
 
   state.filteredGroups = filtered.slice(0,200);
   $('groupCount').textContent = state.filteredGroups.length.toLocaleString('zh-TW');
@@ -4201,12 +4432,24 @@ function renderSuggest(containerId, items, onClick) {
   });
 }
 
+
+function getDetailRowsForRange(start, end){
+  const half = filterByRange(state.halfDetails || [], start, end);
+  if (half.length) return half;
+  return filterByRange(state.details || [], start, end);
+}
+function getDetailSourceRowsForChart(start, end){
+  const half = filterByRange(state.halfDetails || [], start, end);
+  if (half.length) return state.halfDetails || [];
+  return state.details || [];
+}
+
 function getSelectedRangeRows() {
   const {start, end} = getDateRange();
 
   // Cards / tables use the strict selected range
   const srows = filterByRange(state.summary, start, end);
-  const drows = filterByRange(state.details, start, end);
+  const drows = getDetailRowsForRange(start, end);
 
   // Charts (month mode): include cross-month days for weeks that intersect the month
   let srowsChart = srows;
@@ -4214,7 +4457,7 @@ function getSelectedRangeRows() {
   if (state.mode === 'month') {
     const ex = expandToWholeWeeks(start, end);
     srowsChart = filterByRange(state.summary, ex.start, ex.end);
-    drowsChart = filterByRange(state.details, ex.start, ex.end);
+    drowsChart = getDetailRowsForRange(ex.start, ex.end);
   }
 
   const augSummary = augmentSummaryRowsWithDetails(srows, drows);
@@ -4370,12 +4613,14 @@ function renderSelectedItem() {
     chartEnd = ex.end;
   }
 
+  const sourceRows = getDetailSourceRowsForChart(chartStart, chartEnd);
+
   // 表格：維持嚴格月份區間
-  const drowsBase = filterByRange(state.details, start, end)
+  const drowsBase = filterByRange(sourceRows, start, end)
     .filter(r => (r.product + '||' + r.semi) === state.selectedKey);
 
   // 趨勢圖：使用擴展後區間
-  const drowsChart = filterByRange(state.details, chartStart, chartEnd)
+  const drowsChart = filterByRange(sourceRows, chartStart, chartEnd)
     .filter(r => (r.product + '||' + r.semi) === state.selectedKey);
   if (!drowsBase.length && !drowsChart.length) {
     $('itemPanel').classList.add('hidden');
@@ -4619,9 +4864,24 @@ function renderItemChart(daily) {
       label: '補單量',
       kind: 'qty',
       unitTitle: '數量',
-      get: (r) => r.refill,
+      get: (r) => Number.isFinite(Number(r.refillQtyNew)) ? r.refillQtyNew : r.refill,
       fmt: (v) => fmtInt(v),
       tick: (v) => Math.round(Number(v)).toLocaleString('zh-TW')
+    },
+    refillRateNew: {
+      label: '補單率',
+      kind: 'rate',
+      unitTitle: '%',
+      get: (r) => {
+        const explicit = Number(r.refillRateNew);
+        if (Number.isFinite(explicit)) return explicit;
+        const q = Number(r.refillQtyNew), o = Number(r.order);
+        return (Number.isFinite(q) && Number.isFinite(o) && o > 0) ? (q / o) : null;
+      },
+      qtyField: 'refillQtyNew',
+      orderField: 'order',
+      fmt: (v) => fmtPct(v),
+      tick: (v) => (Number(v) * 100).toFixed(1) + '%'
     },
     orderQty: {
       label: '訂單需求',
