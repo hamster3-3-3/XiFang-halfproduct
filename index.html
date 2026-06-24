@@ -1804,16 +1804,24 @@ function top20RowReasonKey(r){
 
 function parseTop20FromWB(wb, fileName){
   const fileText = safeStr(fileName);
-  // 年份一律以來源檔案/manifest 路徑判斷；週別(月日區間)一律以各列 B欄「月別」判斷。
-  // 例如來源為 2026/06/【JFM指導】...0609-15.xlsx，B欄為 0526-0601，則視為 2026 年的 0526-0601。
+  // 前二十大原因明細不再用固定欄位硬抓。
+  // 5 月前/後的 JFM 版型不同，這裡改為：
+  // 1) 年份以來源檔案/manifest 路徑判斷。
+  // 2) 週別以「報廢20大－原因別分析 / 超用20大－原因別分析」內的「月別」區塊文字判斷。
+  // 3) 每列的排序、半成品、金額、分析原因以列內內容動態定位，避免欄位位移造成誤抓。
   const fileYear = (fileText.match(/(20\d{2})/)||[])[1] || (state.selection && state.selection.year ? String(state.selection.year) : null) || null;
   const reasonKeys = new Set(REASON_DEFS.map(d => d.key));
 
   function valueAt(row, c){ return (c>=0 && c<row.length) ? row[c] : null; }
+  function isHeaderText(t){
+    const x = safeStr(t).trim();
+    if (!x) return false;
+    return /^(月別|日期|排序|排名|序號|半成品|半成品名稱|半成品名|名稱|商品名|商品名稱|單價|報廢金額|超用金額|原因說明|其他原因說明|後續對策|備註商品名稱|備註-商品名稱|總件數|次數|金額|比例|占比|kg\/個|kg|元|%)$/.test(x);
+  }
   function cleanText(v){
     const t = safeStr(v).trim();
     if (!t) return '';
-    if (/^(月別|日期|排序|排名|序號|半成品|半成品名稱|商品名|商品名稱|單價|報廢金額|超用金額|原因說明|其他原因說明|後續對策|備註商品名稱|備註-商品名稱|總件數|金額|比例|占比|kg\/個|kg|元|%)$/.test(t)) return '';
+    if (isHeaderText(t)) return '';
     return t;
   }
   function isBadTop20Text(t){
@@ -1823,7 +1831,7 @@ function parseTop20FromWB(wb, fileName){
     if (/^#+$/.test(x)) return true;
     if (/^\d+(\.\d+)?$/.test(x)) return true;
     if (/^NT\$?\s*\d/i.test(x)) return true;
-    if (['原因說明','其他原因說明','後續對策','分析原因','半成品名稱','單價','月別','日期','排序','排名','序號','總件數','金額','比例','占比'].includes(x)) return true;
+    if (isHeaderText(x)) return true;
     return false;
   }
   function reasonKeyFromValue(v){
@@ -1831,14 +1839,14 @@ function parseTop20FromWB(wb, fileName){
     return reasonKeys.has(k) ? k : '';
   }
   function rangeInfoFromMarker(v){
-    // 以「報廢20大－原因別分析 / 超用20大－原因別分析」B欄「月別」作為唯一週別定位來源。
-    // 支援：0609-0615、0609-15、6/9-6/15、6/9-15。
-    // 年份不從 B欄判斷，而是從來源檔案/manifest 路徑判斷；B欄只負責 MMDD-MMDD。
+    // 支援：0609-0615、0609-15、6/9-6/15、6/9-15、6/9-6/15總合計↑。
     let t = toHalfWidth(safeStr(v)).replace(/\s+/g,'').replace(/[～~—－]/g,'-');
     t = t.replace(/總合計[↑↗]*$/,'').replace(/總合計/g,'').trim();
-    if (!t || t === '月別') return null;
+    if (!t || t === '月別' || t === '日期') return null;
+
     const withMonth = (rangeKey, endMM) => {
       const rk = normRangeKey(rangeKey);
+      if (!rk) return null;
       return {
         rangeKey: rk,
         year: fileYear,
@@ -1864,28 +1872,86 @@ function parseTop20FromWB(wb, fileName){
     if (m) return withMonth(`${m[1]}-${m[1].slice(0,2)}${m[2]}`, m[1].slice(0,2));
     return null;
   }
-  function numericUnitCandidate(row, candidates){
-    for (const c of candidates){
-      const n = asNumber(valueAt(row, c));
-      if (Number.isFinite(n) && n > 0) return n;
+  function rangeInfoFromRow(row){
+    // 月別欄在新版/舊版可能位於 A 或 B，保守掃描左側 6 欄。
+    for (let c=0; c<Math.min(6, (row||[]).length); c++){
+      const info = rangeInfoFromMarker(valueAt(row, c));
+      if (info && info.rangeKey) return info;
     }
     return null;
   }
-  function findLayout(row){
-    // 新豐前20大原因別分析實際存在多種版型，必須以列內「分析原因」欄位判斷，不能只套固定欄位。
-    // 版型A（目前0609-0615檔）：H=類別、I=分析原因、J=原因說明、K=後續對策、L=次數、M=備註-商品名稱。
-    // 版型B：U=分析原因、V=原因說明、W=後續對策、X=次數、Y=備註商品名稱。
-    // 版型C：W=分析原因、X=原因說明、Y=後續對策、Z=次數、AA=備註-商品名稱。
-    // 注意：版型A 的 G 欄是生產資訊/產出量，不是單價，因此不得拿來當單價。
-    const compactReasonKey = reasonKeyFromValue(valueAt(row, 8));
-    if (compactReasonKey) return { name:'compact', categoryCol:7, reasonCol:8, descCol:9, actCol:10, timesCol:11, productCol:12, unitCols:[] };
+  function findRankCol(row){
+    // 排序欄在 5 月前/後常左右位移，直接找左側第一個 1~20 的整數。
+    for (let c=0; c<Math.min(10, (row||[]).length); c++){
+      const raw = valueAt(row, c);
+      if (raw == null || raw === '') continue;
+      const n = asNumber(raw);
+      if (Number.isInteger(n) && n >= 1 && n <= 20) return c;
+    }
+    return -1;
+  }
+  function findSemiCol(row, rankCol){
+    for (let c=rankCol+1; c<Math.min(rankCol+8, (row||[]).length); c++){
+      const t = cleanText(valueAt(row, c));
+      if (isBadTop20Text(t)) continue;
+      if (reasonKeyFromValue(t)) continue;
+      // 避免把分類欄當作半成品名。
+      if (['原物料','組合室','組合端','組合蓋','其他原因','研發設定','取樣不穩','製程不穩','原物料規格','調理多產','步留不足'].includes(t)) continue;
+      return c;
+    }
+    return -1;
+  }
+  function findAmtCol(row, semiCol){
+    // 金額欄通常緊接半成品名右側；用第一個正數欄位，可同時支援新版與舊版位移。
+    for (let c=semiCol+1; c<Math.min(semiCol+8, (row||[]).length); c++){
+      const n = asNumber(valueAt(row, c));
+      if (Number.isFinite(n) && Math.abs(n) > 0) return c;
+    }
+    return -1;
+  }
+  function findReasonCol(row, amtCol){
+    const len = (row||[]).length;
+    for (let c=Math.max(0, amtCol+1); c<len; c++){
+      if (reasonKeyFromValue(valueAt(row, c))) return c;
+    }
+    // 例外備援：若金額欄推定失敗，仍掃描整列找分析原因。
+    for (let c=0; c<len; c++){
+      if (reasonKeyFromValue(valueAt(row, c))) return c;
+    }
+    return -1;
+  }
+  function textAfter(row, startCol, maxOffset){
+    const end = Math.min((row||[]).length, startCol + 1 + maxOffset);
+    for (let c=startCol+1; c<end; c++){
+      const t = cleanText(valueAt(row, c));
+      if (isBadTop20Text(t)) continue;
+      if (reasonKeyFromValue(t)) continue;
+      return {text:t, col:c};
+    }
+    return {text:'', col:-1};
+  }
+  function productCandidate(row, reasonCol){
+    // 目前三種版型都約為：分析原因、原因說明、後續對策、次數、備註商品名稱。
+    const directCol = reasonCol + 4;
+    let t = cleanText(valueAt(row, directCol));
+    if (!isBadTop20Text(t) && !reasonKeyFromValue(t)) return t;
 
-    const oldReasonKey = reasonKeyFromValue(valueAt(row, 20));
-    if (oldReasonKey) return { name:'old', categoryCol:19, reasonCol:20, descCol:21, actCol:22, timesCol:23, productCol:24, unitCols:[11] };
-
-    const newReasonKey = reasonKeyFromValue(valueAt(row, 22));
-    if (newReasonKey) return { name:'new', categoryCol:21, reasonCol:22, descCol:23, actCol:24, timesCol:25, productCol:26, unitCols:[6,11] };
-
+    // 若部分檔案少了「次數」欄或備註欄再位移，掃描後方文字欄；寧可留空，也不要拿原因說明/對策當商品名。
+    for (let c=reasonCol+3; c<Math.min(reasonCol+8, (row||[]).length); c++){
+      t = cleanText(valueAt(row, c));
+      if (isBadTop20Text(t) || reasonKeyFromValue(t)) continue;
+      const before = [cleanText(valueAt(row, reasonCol+1)), cleanText(valueAt(row, reasonCol+2))].filter(Boolean);
+      if (before.includes(t)) continue;
+      return t;
+    }
+    return '';
+  }
+  function unitPriceCandidate(row, amtCol, reasonCol){
+    // 單價通常位於金額欄後、分析原因前的生產資訊區，取合理的小數/正數；若取不到則後續由日報明細反查。
+    for (let c=Math.max(0, amtCol+1); c<Math.min(reasonCol, amtCol+8); c++){
+      const n = asNumber(valueAt(row, c));
+      if (Number.isFinite(n) && n > 0 && n < 10000) return n;
+    }
     return null;
   }
 
@@ -1904,35 +1970,41 @@ function parseTop20FromWB(wb, fileName){
     for (let r=0; r<rows.length; r++){
       const row = rows[r] || [];
 
-      const marker = rangeInfoFromMarker(valueAt(row, 1)); // B欄「月別」
+      const marker = rangeInfoFromRow(row);
       if (marker && marker.rangeKey){
         currentRangeKey = normRangeKey(marker.rangeKey);
         currentYear = marker.year || fileYear || currentYear;
         currentMonthKey = marker.monthKey || (currentRangeKey ? monthKeyFromRangeKey(currentRangeKey, fileName) : null);
       }
 
-      const sortVal = asNumber(valueAt(row, 3));       // D 排序
-      const semi = cleanText(valueAt(row, 4));          // E 半成品名稱
-      const amt = asNumber(valueAt(row, 5));            // F 報廢/超用金額
-      const hasRank = Number.isFinite(sortVal) && sortVal >= 1 && sortVal <= 20;
-      if (!hasRank) continue;
-      if (!currentRangeKey) continue;                   // 沒有 B欄週別定位的資料不納入，避免誤抓其他區塊
+      if (!currentRangeKey) continue;
+
+      const rankCol = findRankCol(row);
+      if (rankCol < 0) continue;
+
+      const semiCol = findSemiCol(row, rankCol);
+      if (semiCol < 0) continue;
+      const semi = cleanText(valueAt(row, semiCol));
       if (!semi || isBadTop20Text(semi)) continue;
+
+      const amtCol = findAmtCol(row, semiCol);
+      if (amtCol < 0) continue;
+      const amt = asNumber(valueAt(row, amtCol));
       if (!Number.isFinite(amt) || Math.abs(amt) <= 0) continue;
 
-      const layout = findLayout(row);
-      if (!layout) continue;
-
-      const reason = cleanText(valueAt(row, layout.reasonCol));
+      const reasonCol = findReasonCol(row, amtCol);
+      if (reasonCol < 0) continue;
+      const reason = cleanText(valueAt(row, reasonCol));
       const reasonKey = reasonKeyFromValue(reason);
       if (!reasonKey) continue;
 
-      let product = cleanText(valueAt(row, layout.productCol));
+      const descInfo = textAfter(row, reasonCol, 3);
+      const actInfo = descInfo.col >= 0 ? textAfter(row, descInfo.col, 3) : {text:'', col:-1};
+      const times = asNumber(valueAt(row, reasonCol + 3));
+      const category = cleanText(valueAt(row, reasonCol - 1));
+      let product = productCandidate(row, reasonCol);
       if (isBadTop20Text(product)) product = '';
-
-      const unitPrice = numericUnitCandidate(row, layout.unitCols);
-      const times = asNumber(valueAt(row, layout.timesCol));
-      const category = cleanText(valueAt(row, layout.categoryCol));
+      const unitPrice = unitPriceCandidate(row, amtCol, reasonCol);
 
       out.push({
         kind,
@@ -1945,12 +2017,12 @@ function parseTop20FromWB(wb, fileName){
         semi,
         unitPrice: Number.isFinite(unitPrice) ? unitPrice : null,
         amt: Number.isFinite(amt) ? amt : 0,
-        desc: cleanText(valueAt(row, layout.descCol)),
-        act: cleanText(valueAt(row, layout.actCol)),
+        desc: descInfo.text || '',
+        act: actInfo.text || '',
         times: Number.isFinite(times) ? times : null,
         source: safeStr(fileName),
         year: currentYear || fileYear,
-        layout: layout.name,
+        layout: `dynamic:r${rankCol}:s${semiCol}:a${amtCol}:reason${reasonCol}`,
         sourceSheet: sname,
         sourceRow: r + 1
       });
