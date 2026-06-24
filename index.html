@@ -1766,6 +1766,17 @@ function normalizeReasonKey(s){
   return t;
 }
 
+
+function top20RowReasonKey(r){
+  // 5月後各廠 JFM 的前20大表，原因欄位有時會因合併儲存格/欄位名稱差異而讀不到。
+  // 比對時同時看 reason、reasonKey、原因說明與後續對策，避免卡片有數字但展開列表為空。
+  if (!r) return '';
+  const direct = normalizeReasonKey(r.reasonKey || r.reason || '');
+  if (direct) return direct;
+  const txt = [r.reason, r.desc, r.act, r.note, r.category].map(x => safeStr(x)).join(' ');
+  return normalizeReasonKey(txt);
+}
+
 function parseTop20FromWB(wb, fileName){
   const fileText = safeStr(fileName);
   const fileYear = (fileText.match(/(20\d{2})/)||[])[1] || null;
@@ -1868,18 +1879,22 @@ function parseTop20FromWB(wb, fileName){
       const rangeKey = rowRangeKey || lastRangeKey || fileRangeKey || null;
 
       const sortVal = (cSort>=0) ? asNumber(row[cSort]) : NaN;
-      if (!(Number.isFinite(sortVal) && sortVal >= 1 && sortVal <= 20)) continue;
 
       const semi = (cSemiName>=0) ? safeStr(row[cSemiName]).trim() : '';
       const productRaw = (cProduct>=0) ? safeStr(row[cProduct]).trim() : '';
       const reason = (cReason>=0) ? safeStr(row[cReason]).trim() : '';
       const desc = (cDesc>=0) ? safeStr(row[cDesc]).trim() : '';
       const act  = (cAct>=0) ? safeStr(row[cAct]).trim() : '';
-
-      if (!semi && !productRaw && !reason && !desc && !act) continue;
-
       const amt = (cAmt>=0) ? asNumber(row[cAmt]) : NaN;
       const unitPrice = (cUnit>=0) ? asNumber(row[cUnit]) : NaN;
+
+      const hasRank = Number.isFinite(sortVal) && sortVal >= 1 && sortVal <= 20;
+      const hasContent = !!(semi || productRaw || reason || desc || act);
+      const hasAmount = Number.isFinite(amt) && Math.abs(amt) > 0;
+      // 部分新版 JFM 前20大表沒有穩定的「排序」欄，原本會整列跳過，導致展開列表空白。
+      // 現改為：有排序照排序；若沒有排序，只要有金額與內容也視為有效列。
+      if (!hasRank && !(hasAmount && hasContent)) continue;
+      if (!hasContent) continue;
 
       out.push({
         kind,
@@ -5750,7 +5765,7 @@ function renderTop20Expand(){
     $('top20ExpAmtHeader').textContent='超用金額';
   }
 
-  let rows = (state.top20Entries||[]).filter(r => r.kind===kind && normalizeReasonKey(r.reason)===normalizeReasonKey(reasonKey));
+  let rows = (state.top20Entries||[]).filter(r => r.kind===kind && top20RowReasonKey(r)===normalizeReasonKey(reasonKey));
 
   const act = Array.isArray(st.activeSources) ? st.activeSources : [];
   if (act.length) rows = rows.filter(r => act.includes(r.source));
