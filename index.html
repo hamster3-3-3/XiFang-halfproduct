@@ -1802,6 +1802,8 @@ function top20RowReasonKey(r){
 
 function parseTop20FromWB(wb, fileName){
   const fileText = safeStr(fileName);
+  // 年份一律以來源檔案/manifest 路徑判斷；週別(月日區間)一律以各列 B欄「月別」判斷。
+  // 例如來源為 2026/06/【JFM指導】...0609-15.xlsx，B欄為 0526-0601，則視為 2026 年的 0526-0601。
   const fileYear = (fileText.match(/(20\d{2})/)||[])[1] || null;
   const reasonKeys = new Set(REASON_DEFS.map(d => d.key));
 
@@ -1829,14 +1831,18 @@ function parseTop20FromWB(wb, fileName){
   function rangeInfoFromMarker(v){
     // 以「報廢20大－原因別分析 / 超用20大－原因別分析」B欄「月別」作為唯一週別定位來源。
     // 支援：0609-0615、0609-15、6/9-6/15、6/9-15。
-    // 重點：即使 manifest 只寫檔名、沒有 2026/06 路徑，也要能解析 rangeKey；year/monthKey 僅作輔助。
+    // 年份不從 B欄判斷，而是從來源檔案/manifest 路徑判斷；B欄只負責 MMDD-MMDD。
     let t = toHalfWidth(safeStr(v)).replace(/\s+/g,'').replace(/[～~—－]/g,'-');
     t = t.replace(/總合計[↑↗]*$/,'').replace(/總合計/g,'').trim();
     if (!t || t === '月別') return null;
-    const withMonth = (rangeKey, endMM) => ({
-      rangeKey: normRangeKey(rangeKey),
-      monthKey: fileYear ? `${fileYear}-${String(endMM).padStart(2,'0')}` : null
-    });
+    const withMonth = (rangeKey, endMM) => {
+      const rk = normRangeKey(rangeKey);
+      return {
+        rangeKey: rk,
+        year: fileYear,
+        monthKey: (fileYear && endMM) ? `${fileYear}-${String(endMM).padStart(2,'0')}` : null
+      };
+    };
 
     let m = t.match(/(\d{1,2})\/(\d{1,2})-(\d{1,2})\/(\d{1,2})/);
     if (m) {
@@ -1891,6 +1897,7 @@ function parseTop20FromWB(wb, fileName){
 
     let currentRangeKey = null;
     let currentMonthKey = null;
+    let currentYear = fileYear || null;
 
     for (let r=0; r<rows.length; r++){
       const row = rows[r] || [];
@@ -1898,6 +1905,7 @@ function parseTop20FromWB(wb, fileName){
       const marker = rangeInfoFromMarker(valueAt(row, 1)); // B欄「月別」
       if (marker && marker.rangeKey){
         currentRangeKey = normRangeKey(marker.rangeKey);
+        currentYear = marker.year || fileYear || currentYear;
         currentMonthKey = marker.monthKey || (currentRangeKey ? monthKeyFromRangeKey(currentRangeKey, fileName) : null);
       }
 
@@ -1939,7 +1947,7 @@ function parseTop20FromWB(wb, fileName){
         act: cleanText(valueAt(row, layout.actCol)),
         times: Number.isFinite(times) ? times : null,
         source: safeStr(fileName),
-        year: fileYear,
+        year: currentYear || fileYear,
         layout: layout.name,
         sourceSheet: sname,
         sourceRow: r + 1
@@ -5698,11 +5706,15 @@ function renderTop20Expand(){
   }
 
   const wantedReason = normalizeReasonKey(reasonKey);
+  const selectedYear = (state.selection && state.selection.year) ? String(state.selection.year) : safeStr(state.selection?.start).slice(0,4);
   let rows = (state.top20Entries||[]).filter(r => r.kind===kind && top20RowReasonKey(r)===wantedReason);
 
-  // 前二十大細項必須以「報廢20大－原因別分析 / 超用20大－原因別分析」B欄月別定位。
-  // 週別模式：B欄必須精準等於目前週別，例如 0609-0615。
-  // 月別模式：B欄週別只要落在/碰到目前月份即可。
+  // 前二十大細項必須以「年份=來源檔案」+「區間=B欄月別」定位。
+  // 週別模式：B欄必須精準等於目前週別，例如 0609-0615；同時用來源檔案年份排除跨年度同 MMDD 的資料。
+  // 月別模式：B欄週別只要落在/碰到目前月份即可；同樣以來源檔案年份輔助排除跨年度資料。
+  if (selectedYear){
+    rows = rows.filter(r => !r.year || String(r.year) === selectedYear);
+  }
   if (rangeKey){
     rows = rows.filter(r => normRangeKey(r.rangeKey) === rangeKey);
   } else if (monthKey){
