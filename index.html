@@ -1322,7 +1322,10 @@ async function loadManifest() {
       "2026/05/【JFM指導】新豐廠生產管理報表0428-0504.xlsx",
       "2026/05/【JFM指導】新豐廠生產管理報表0505-11.xlsx",
       "2026/05/【JFM指導】新豐廠生產管理報表0512-18.xlsx",
-      "2026/05/【JFM指導】新豐廠生產管理報表0519-25.xlsx"
+      "2026/05/【JFM指導】新豐廠生產管理報表0519-25.xlsx",
+      "2026/06/115.06.01-30屏榮新豐廠半成品生產管理日報.xlsx",
+      "2026/06/【JFM指導】新豐廠生產管理報表0602-08.xlsx",
+      "2026/06/【JFM指導】新豐廠生產管理報表0609-15.xlsx"
     ];
   }
   return [];
@@ -1849,7 +1852,10 @@ function parseTop20FromWB(wb, fileName){
 
     // 新豐 5月後 JFM 前20大版面欄位固定，但合併儲存格會讓模糊表頭誤抓。
     // 固定欄位優先：B 月別、D 排序、E 半成品、F 金額、G 單價、W 分析原因、X 原因說明、Y 後續對策、Z 次數、AA 備註商品名稱。
-    const FIX = { month:1, sort:3, semi:4, amt:5, unit:6, reason:22, desc:23, act:24, times:25, product:26 };
+    // 新豐 2026/05 以後前20大固定欄位（0-based）：
+    // B 月別、D 排序、E 半成品、F 金額、L 單價、U 分析原因、V 原因說明、W 後續對策、X 次數、Y 備註商品名稱。
+    // 原程式將單價/原因/商品欄位往後偏移，會造成商品名顯示成「週前二十」或金額、半成品名顯示成數字。
+    const FIX = { month:1, sort:3, semi:4, amt:5, unit:11, reason:20, desc:21, act:22, times:23, product:24 };
 
     const headerRows = Math.min(10, rows.length);
     const maxC = Math.max(...rows.slice(0, headerRows).map(r => (r || []).length), 0);
@@ -1913,7 +1919,9 @@ function parseTop20FromWB(wb, fileName){
       const row = rows[r] || [];
       const rowRangeKey = top20RangeKeyFromText(valueAt(row, cMonth));
       if (rowRangeKey) lastRangeKey = rowRangeKey;
-      const rangeKey = rowRangeKey || lastRangeKey || fileRangeKey || null;
+      // 週檔內 B 欄「月別」常殘留舊週別（例如 1202-1208），
+      // 因此前20大週別一律優先採用檔名解析出的區間。
+      const rangeKey = fileRangeKey || rowRangeKey || lastRangeKey || null;
 
       const sortVal = asNumber(valueAt(row, cSort));
       const semi = cleanText(valueAt(row, cSemi));
@@ -2816,7 +2824,7 @@ function parseReasonFromWB(wb, fileName){
       else setRange(fileYear, m[1], m[2], m[1], m[3]);
     }
 
-    // B. 檔名內週別：生產管理報表2026.0501-0503 / 生產管理報表0501-03 / 0501-0503
+    // B. 檔名內週別：生產管理報表2026.0501-0503 / 生產管理報表0501-03 / 0501-0503 / 0609-15
     if (!rangeKey){
       m = fileText.match(/(20\d{2})[.\-_/]?(\d{2})(\d{2})-(\d{2})(\d{2})/);
       if (m) setRange(m[1], m[2], m[3], m[4], m[5]);
@@ -2824,9 +2832,9 @@ function parseReasonFromWB(wb, fileName){
     if (!rangeKey){
       const ym = fileText.match(/(20\d{2})\/(0[1-9]|1[0-2])\//);
       m = fileText.match(/生產管理報表(\d{4})-(\d{2,4})/);
-      if (ym && m){
-        const baseYear = Number(ym[1]);
-        const folderMonth = Number(ym[2]);
+      if (m){
+        const baseYear = ym ? Number(ym[1]) : fileYear;
+        const folderMonth = ym ? Number(ym[2]) : Number(String(m[1]).slice(0,2));
         const a = String(m[1]).padStart(4,'0');
         let b = String(m[2]);
         if (b.length === 2) b = a.slice(0,2) + b;
@@ -2872,17 +2880,34 @@ function parseReasonFromWB(wb, fileName){
 
   function findNearbyAmount(reasonRow, reasonCol, kind){
     const kw = kind === 'scrap' ? '報廢' : '超用';
-    const colPriority = [reasonCol, reasonCol+1, reasonCol-1, reasonCol+2, reasonCol-2].filter(c => c >= 0);
+    // 金額欄位與原因名稱同欄；百分比在右側一欄。
+    // 不再把 reasonCol+1 當作金額候補，避免抓到比例造成金額錯誤。
+    const colPriority = [reasonCol, reasonCol-1, reasonCol+2, reasonCol-2].filter(c => c >= 0);
     for (let r=reasonRow; r<Math.min(rows.length, reasonRow+10); r++){
       const row = rows[r] || [];
       const rowText = row.map(normCell).join('|');
       if (!rowText.includes(kw)) continue;
       for (const c of colPriority){
         const n = asNumber(row[c]);
-        if (Number.isFinite(n)) return n;
+        if (Number.isFinite(n) && Math.abs(n) >= 1) return n;
       }
     }
     return 0;
+  }
+
+  function findNearbyPct(reasonRow, reasonCol, kind){
+    const kw = kind === 'scrap' ? '報廢' : '超用';
+    const colPriority = [reasonCol+1, reasonCol].filter(c => c >= 0);
+    for (let r=reasonRow; r<Math.min(rows.length, reasonRow+10); r++){
+      const row = rows[r] || [];
+      const rowText = row.map(normCell).join('|');
+      if (!rowText.includes(kw)) continue;
+      for (const c of colPriority){
+        const n = normalizeExcelRate(row[c]);
+        if (Number.isFinite(n) && n >= 0 && n <= 1) return n;
+      }
+    }
+    return null;
   }
 
   function parseReasonDynamicRows(){
@@ -2903,6 +2928,8 @@ function parseReasonFromWB(wb, fileName){
           reason: label,
           scrapAmt: findNearbyAmount(r, c, 'scrap'),
           overuseAmt: findNearbyAmount(r, c, 'over'),
+          scrapPct: findNearbyPct(r, c, 'scrap'),
+          overusePct: findNearbyPct(r, c, 'over'),
           source: safeStr(fileName)
         };
         const k = [rec.start, rec.end, rec.rangeKey, rec.monthKey, rec.reason, rec.source].join('|');
@@ -2956,6 +2983,8 @@ function parseReasonFromWB(wb, fileName){
         reason: labels[i],
         scrapAmt: cellNum(rS, cA),
         overuseAmt: cellNum(rO, cA),
+        scrapPct: normalizeExcelRate((rows[rS]||[])[cA+1]),
+        overusePct: normalizeExcelRate((rows[rO]||[])[cA+1]),
         source: safeStr(fileName)
       };
       const k = [rec.start, rec.end, rec.reason, rec.source].join('|');
@@ -2995,6 +3024,8 @@ function parseReasonFromWB(wb, fileName){
           reason: labels[i],
           scrapAmt: cellNum(rS, cA),
           overuseAmt: cellNum(rO, cA),
+          scrapPct: normalizeExcelRate((rows[rS]||[])[cA+1]),
+          overusePct: normalizeExcelRate((rows[rO]||[])[cA+1]),
           source: safeStr(fileName)
         });
       }
@@ -3909,7 +3940,7 @@ function renderReasonCards(rangeStartISO, rangeEndISO){
     const selEnd   = rangeEndISO;
 
     const sums = {};
-    for (const def of REASON_DEFS) sums[def.key] = { scrap: 0, over: 0 };
+    for (const def of REASON_DEFS) sums[def.key] = { scrap: 0, over: 0, scrapPctVals: [], overPctVals: [] };
 
     let entries = Array.isArray(state.reasonWeeks) ? state.reasonWeeks : [];
     const actSrc = Array.isArray(state.activeJfmSources) ? state.activeJfmSources : [];
@@ -3954,14 +3985,20 @@ function renderReasonCards(rangeStartISO, rangeEndISO){
       if (!r) continue;
       const key = mapReasonToKey(r.reason);
       if (!key) continue;
-      if (!sums[key]) sums[key] = {scrap:0, over:0};
+      if (!sums[key]) sums[key] = {scrap:0, over:0, scrapPctVals: [], overPctVals: []};
       sums[key].scrap += Number(r.scrapAmt) || 0;
       sums[key].over  += Number(r.overuseAmt) || 0;
+      if (Number.isFinite(Number(r.scrapPct))) sums[key].scrapPctVals.push(Number(r.scrapPct));
+      if (Number.isFinite(Number(r.overusePct))) sums[key].overPctVals.push(Number(r.overusePct));
     }
 
     const totalScrap = Object.values(sums).reduce((a,b)=>a+(Number(b.scrap)||0),0);
     const totalOver  = Object.values(sums).reduce((a,b)=>a+(Number(b.over)||0),0);
-    const pctOrDash = (v, tot) => (tot>0 ? `${(v/tot*100).toFixed(2)}%` : '—');
+    const pctOrDash = (v, tot, vals) => {
+      // 單一週檔/單一月檔優先顯示 JFM 7-1 表內比例欄，避免金額比例被重算後與來源表不一致。
+      if (Array.isArray(vals) && vals.length === 1 && Number.isFinite(vals[0])) return `${(vals[0]*100).toFixed(2)}%`;
+      return (tot>0 ? `${(v/tot*100).toFixed(2)}%` : '—');
+    };
 
     const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
 
@@ -3969,8 +4006,8 @@ function renderReasonCards(rangeStartISO, rangeEndISO){
       const v = sums[def.key] || {scrap:0, over:0};
       set(`r_${def.key}_scrap_amt`, fmtMoney(v.scrap));
       set(`r_${def.key}_over_amt`,  fmtMoney(v.over));
-      set(`r_${def.key}_scrap_pct`, pctOrDash(v.scrap, totalScrap));
-      set(`r_${def.key}_over_pct`,  pctOrDash(v.over, totalOver));
+      set(`r_${def.key}_scrap_pct`, pctOrDash(v.scrap, totalScrap, v.scrapPctVals));
+      set(`r_${def.key}_over_pct`,  pctOrDash(v.over, totalOver, v.overPctVals));
     }
   }catch(err){
     console.error('[renderReasonCards] failed', err);
