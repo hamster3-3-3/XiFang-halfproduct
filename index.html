@@ -875,6 +875,8 @@ const state = {
   top20Entries: [],
   loadedMonthKeys: new Set(),
   monthLoadPromises: new Map(),
+  loadedJfmFiles: new Set(),
+  jfmLoadErrors: [],
   manifestIntervals: [],
   loadErrors: [],
   launchPromise: null
@@ -1804,7 +1806,7 @@ function parseTop20FromWB(wb, fileName){
   const fileText = safeStr(fileName);
   // 年份一律以來源檔案/manifest 路徑判斷；週別(月日區間)一律以各列 B欄「月別」判斷。
   // 例如來源為 2026/06/【JFM指導】...0609-15.xlsx，B欄為 0526-0601，則視為 2026 年的 0526-0601。
-  const fileYear = (fileText.match(/(20\d{2})/)||[])[1] || null;
+  const fileYear = (fileText.match(/(20\d{2})/)||[])[1] || (state.selection && state.selection.year ? String(state.selection.year) : null) || null;
   const reasonKeys = new Set(REASON_DEFS.map(d => d.key));
 
   function valueAt(row, c){ return (c>=0 && c<row.length) ? row[c] : null; }
@@ -3109,7 +3111,17 @@ function dedupeLoadedData(){
     rm.set(k, r);
   }
   state.reasonWeeks = Array.from(rm.values());
-  state.top20Entries = state.top20Entries || [];
+
+  const tm = new Map();
+  for (const r of (state.top20Entries || [])) {
+    if (!r) continue;
+    const k = [
+      r.kind, r.year, normRangeKey(r.rangeKey), top20RowReasonKey(r),
+      normKey(r.product), normKey(r.semi), Math.round((Number(r.amt)||0) * 100) / 100, r.sourceSheet || '', r.sourceRow || ''
+    ].join('|');
+    tm.set(k, r);
+  }
+  state.top20Entries = Array.from(tm.values());
 }
 
 async function ensureDataForMonthKeys(monthKeys){
@@ -3150,6 +3162,7 @@ async function ensureDataForMonthKeys(monthKeys){
         const wb = XLSX.read(ab, {type:'array', cellDates:true});
         reasons = reasons.concat(parseReasonFromWB(wb, f));
         top20 = top20.concat(parseTop20FromWB(wb, f));
+        if (state.loadedJfmFiles && typeof state.loadedJfmFiles.add === 'function') state.loadedJfmFiles.add(f);
       }
     } catch (e) {
       console.warn(e);
@@ -3214,6 +3227,8 @@ async function loadAllData() {
   state.top20Entries = [];
   state.loadedMonthKeys = new Set();
   state.monthLoadPromises = new Map();
+  state.loadedJfmFiles = new Set();
+  state.jfmLoadErrors = [];
 
   const intervals = state.manifestIntervals || [];
   if (intervals.length) {
@@ -5543,7 +5558,102 @@ function syncModeUI() {
 }
 
 
-function openTop20ExpandForReason(reasonKey){
+
+async function loadJfmSourcesForTop20(files){
+  files = Array.from(new Set((files || []).filter(Boolean).filter(isJfmFile)));
+  if (!files.length) return;
+
+  state.loadedJfmFiles = state.loadedJfmFiles || new Set();
+  const need = files.filter(f => !state.loadedJfmFiles.has(f));
+  if (!need.length) return;
+
+  const status = $('dataStatus');
+  if (status) {
+    status.innerHTML = `<span class="loader"></span> 補載前20大原因資料中...`;
+    status.classList.add('chip');
+  }
+
+  let reasons = [];
+  let top20 = [];
+  const errors = [];
+  for (const f of need){
+    try{
+      const url = './data/' + encodePath(f);
+      const r = await fetchWithTimeout(url, {cache:'no-store'}, 20000);
+      if (!r.ok) throw new Error('HTTP ' + r.status + '：' + f);
+      const ab = await r.arrayBuffer();
+      const wb = XLSX.read(ab, {type:'array', cellDates:true});
+      reasons = reasons.concat(parseReasonFromWB(wb, f));
+      top20 = top20.concat(parseTop20FromWB(wb, f));
+      state.loadedJfmFiles.add(f);
+    }catch(e){
+      console.warn('[Top20 補載失敗]', e);
+      errors.push(f);
+    }
+  }
+
+  state.reasonWeeks = (state.reasonWeeks || []).concat(reasons);
+  state.top20Entries = (state.top20Entries || []).concat(top20);
+  state.jfmLoadErrors = Array.from(new Set((state.jfmLoadErrors || []).concat(errors)));
+  dedupeLoadedData();
+
+  if (status) {
+    status.textContent = errors.length ? `資料已載入（前20大部分補載失敗 ${errors.length}）` : `資料已載入（前20大已補載）`;
+  }
+}
+
+function getJfmFallbackSourcesForSelectedRange(rangeStartISO, rangeEndISO){
+  const selectedYear = (state.selection && state.selection.year) ? String(state.selection.year) : safeStr(rangeStartISO).slice(0,4);
+  const selectedMonthKey = safeStr(rangeEndISO).slice(0,7) || (state.selection?.year && state.selection?.month ? `${state.selection.year}-${String(state.selection.month).padStart(2,'0')}` : null);
+  const all = (state.manifestFiles || []).filter(isJfmFile);
+
+  const active = computeActiveJfmSources();
+  const out = [];
+  for (const f of active) out.push(f);
+
+  // v7：圖卡可能由「最新 JFM 累積檔」讀到，但前20大細項未被該月載入。
+  // 因此點擊時補載同年度 JFM，且優先載入該選取月份之後的檔案（這些檔通常含歷史月別列，例如 0512-0518）。
+  const yearFiles = all.filter(f => !selectedYear || safeStr(f).includes(selectedYear));
+  const withScore = yearFiles.map(f => {
+    const months = getFileMonthCoverage(f);
+    let score = 0;
+    if (selectedMonthKey && months.includes(selectedMonthKey)) score += 100;
+    // JFM 週檔/累積檔若在選取月份之後，也可能保留 B欄歷史週別，補載優先度次高。
+    const latestMonth = months.slice().sort().at(-1) || '';
+    if (selectedMonthKey && latestMonth >= selectedMonthKey) score += 50;
+    if (/前20|生產管理報表/i.test(baseName(f))) score += 5;
+    return {f, score, latestMonth};
+  }).sort((a,b)=> b.score - a.score || safeLocaleCompare(b.latestMonth, a.latestMonth));
+
+  for (const item of withScore) out.push(item.f);
+  return Array.from(new Set(out));
+}
+
+async function ensureTop20ForCurrentExpand(reasonKey, kind){
+  const st = state._top20Exp;
+  if (!st) return;
+
+  const wantedReason = normalizeReasonKey(reasonKey);
+  const rangeKey = normRangeKey(st.rangeKey);
+  const monthKey = st.monthKey;
+  const selectedYear = (state.selection && state.selection.year) ? String(state.selection.year) : safeStr(state.selection?.start).slice(0,4);
+
+  const hasRows = () => {
+    let rows = (state.top20Entries || []).filter(r => r.kind === kind && top20RowReasonKey(r) === wantedReason);
+    if (selectedYear) rows = rows.filter(r => !r.year || String(r.year) === selectedYear);
+    if (rangeKey) rows = rows.filter(r => normRangeKey(r.rangeKey) === rangeKey);
+    else if (monthKey) rows = rows.filter(r => (r.monthKey === monthKey) || (r.rangeKey && rangeKeyTouchesMonth(normRangeKey(r.rangeKey), monthKey)));
+    return rows.length > 0;
+  };
+
+  if (hasRows()) return;
+
+  const {start: rangeStartISO, end: rangeEndISO} = getDateRange();
+  const candidates = getJfmFallbackSourcesForSelectedRange(rangeStartISO, rangeEndISO);
+  await loadJfmSourcesForTop20(candidates);
+}
+
+async function openTop20ExpandForReason(reasonKey){
   // Keep previous kind if panel already opened
   const prevKind = state._top20Exp?.kind || 'scrap';
 
@@ -5580,10 +5690,16 @@ function openTop20ExpandForReason(reasonKey){
   subParts.push(`重複判定：選取區間前曾出現`);
   $('top20ExpSubtitle').textContent = subParts.join(' ｜ ');
 
-  $('top20ExpTabScrap').onclick = ()=>{ state._top20Exp.kind='scrap'; renderTop20Expand(); };
-  $('top20ExpTabOver').onclick  = ()=>{ state._top20Exp.kind='over';  renderTop20Expand(); };
+  $('top20ExpTabScrap').onclick = async ()=>{ state._top20Exp.kind='scrap'; await ensureTop20ForCurrentExpand(state._top20Exp.reasonKey, 'scrap'); renderTop20Expand(); };
+  $('top20ExpTabOver').onclick  = async ()=>{ state._top20Exp.kind='over'; await ensureTop20ForCurrentExpand(state._top20Exp.reasonKey, 'over'); renderTop20Expand(); };
   $('top20ExpClose').onclick = ()=>{ $('top20Expand').classList.add('hidden'); };
 
+  const body = $('top20ExpBody');
+  const empty = $('top20ExpEmpty');
+  if (body) body.innerHTML = '<tr><td class="py-4 text-slate-500" colspan="7">前20大細項載入中...</td></tr>';
+  if (empty) empty.classList.add('hidden');
+
+  await ensureTop20ForCurrentExpand(reasonKey, state._top20Exp.kind || 'scrap');
   renderTop20Expand();
 }
 
