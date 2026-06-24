@@ -1829,25 +1829,31 @@ function parseTop20FromWB(wb, fileName){
   function rangeInfoFromMarker(v){
     // 以「報廢20大－原因別分析 / 超用20大－原因別分析」B欄「月別」作為唯一週別定位來源。
     // 支援：0609-0615、0609-15、6/9-6/15、6/9-15。
+    // 重點：即使 manifest 只寫檔名、沒有 2026/06 路徑，也要能解析 rangeKey；year/monthKey 僅作輔助。
     let t = toHalfWidth(safeStr(v)).replace(/\s+/g,'').replace(/[～~—－]/g,'-');
     t = t.replace(/總合計[↑↗]*$/,'').replace(/總合計/g,'').trim();
     if (!t || t === '月別') return null;
+    const withMonth = (rangeKey, endMM) => ({
+      rangeKey: normRangeKey(rangeKey),
+      monthKey: fileYear ? `${fileYear}-${String(endMM).padStart(2,'0')}` : null
+    });
+
     let m = t.match(/(\d{1,2})\/(\d{1,2})-(\d{1,2})\/(\d{1,2})/);
-    if (m && fileYear) {
+    if (m) {
       const a = String(Number(m[1])).padStart(2,'0') + String(Number(m[2])).padStart(2,'0');
       const b = String(Number(m[3])).padStart(2,'0') + String(Number(m[4])).padStart(2,'0');
-      return { rangeKey: `${a}-${b}`, monthKey: `${fileYear}-${b.slice(0,2)}` };
+      return withMonth(`${a}-${b}`, Number(m[3]));
     }
     m = t.match(/(\d{1,2})\/(\d{1,2})-(\d{1,2})(?!\d)/);
-    if (m && fileYear) {
+    if (m) {
       const a = String(Number(m[1])).padStart(2,'0') + String(Number(m[2])).padStart(2,'0');
       const b = String(Number(m[1])).padStart(2,'0') + String(Number(m[3])).padStart(2,'0');
-      return { rangeKey: `${a}-${b}`, monthKey: `${fileYear}-${b.slice(0,2)}` };
+      return withMonth(`${a}-${b}`, Number(m[1]));
     }
     m = t.match(/(\d{4})-(\d{4})/);
-    if (m && fileYear) return { rangeKey: `${m[1]}-${m[2]}`, monthKey: `${fileYear}-${m[2].slice(0,2)}` };
+    if (m) return withMonth(`${m[1]}-${m[2]}`, m[2].slice(0,2));
     m = t.match(/(\d{4})-(\d{2})(?!\d)/);
-    if (m && fileYear) return { rangeKey: `${m[1]}-${m[1].slice(0,2)}${m[2]}`, monthKey: `${fileYear}-${m[1].slice(0,2)}` };
+    if (m) return withMonth(`${m[1]}-${m[1].slice(0,2)}${m[2]}`, m[1].slice(0,2));
     return null;
   }
   function numericUnitCandidate(row, candidates){
@@ -1858,13 +1864,20 @@ function parseTop20FromWB(wb, fileName){
     return null;
   }
   function findLayout(row){
-    // 目前新豐表有兩種版型：
-    // 舊版：U=分析原因、V=原因說明、W=後續對策、X=次數、Y=備註商品名稱、L=單價
-    // 新版：W=分析原因、X=原因說明、Y=後續對策、Z=次數、AA=備註商品名稱、G=單價
+    // 新豐前20大原因別分析實際存在多種版型，必須以列內「分析原因」欄位判斷，不能只套固定欄位。
+    // 版型A（目前0609-0615檔）：H=類別、I=分析原因、J=原因說明、K=後續對策、L=次數、M=備註-商品名稱。
+    // 版型B：U=分析原因、V=原因說明、W=後續對策、X=次數、Y=備註商品名稱。
+    // 版型C：W=分析原因、X=原因說明、Y=後續對策、Z=次數、AA=備註-商品名稱。
+    // 注意：版型A 的 G 欄是生產資訊/產出量，不是單價，因此不得拿來當單價。
+    const compactReasonKey = reasonKeyFromValue(valueAt(row, 8));
+    if (compactReasonKey) return { name:'compact', categoryCol:7, reasonCol:8, descCol:9, actCol:10, timesCol:11, productCol:12, unitCols:[] };
+
+    const oldReasonKey = reasonKeyFromValue(valueAt(row, 20));
+    if (oldReasonKey) return { name:'old', categoryCol:19, reasonCol:20, descCol:21, actCol:22, timesCol:23, productCol:24, unitCols:[11] };
+
     const newReasonKey = reasonKeyFromValue(valueAt(row, 22));
     if (newReasonKey) return { name:'new', categoryCol:21, reasonCol:22, descCol:23, actCol:24, timesCol:25, productCol:26, unitCols:[6,11] };
-    const oldReasonKey = reasonKeyFromValue(valueAt(row, 20));
-    if (oldReasonKey) return { name:'old', categoryCol:19, reasonCol:20, descCol:21, actCol:22, timesCol:23, productCol:24, unitCols:[11,6] };
+
     return null;
   }
 
