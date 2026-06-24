@@ -1778,7 +1778,7 @@ function monthKeyFromRangeKey(rangeKey, fileName){
 function normalizeReasonKey(s){
   const t = normKey(s);
   if (!t) return '';
-  if (t.includes(normKey('展開量高於105%')) || t.includes(normKey('展開量高於１０5％')) || t.includes(normKey('展開量高於105％')) || t.includes(normKey('展開量高於需求量'))) return 'above105';
+  if (t.includes(normKey('展開量高於105%')) || t.includes(normKey('展開量高於１０5％')) || t.includes(normKey('展開量高於105％')) || t.includes(normKey('展開量高於需求量')) || t.includes(normKey('展開量105%')) || t.includes(normKey('展開量105％'))) return 'above105';
   if (t.includes(normKey('調理多產'))) return 'tooMuch';
   if (t.includes(normKey('製程不穩')) || t.includes(normKey('製程不穩定'))) return 'process';
   if (t.includes(normKey('取樣不穩')) || t.includes(normKey('取樣不穩定')) || t.includes(normKey('抓樣不穩')) || t.includes(normKey('抓樣不穩定'))) return 'sample';
@@ -1803,43 +1803,37 @@ function top20RowReasonKey(r){
 function parseTop20FromWB(wb, fileName){
   const fileText = safeStr(fileName);
   const fileYear = (fileText.match(/(20\d{2})/)||[])[1] || null;
+  const reasonKeys = new Set(REASON_DEFS.map(d => d.key));
 
   function top20RangeKeyFromText(v){ return normRangeKey(v); }
-
   const fileRangeKey = top20RangeKeyFromText(baseName(fileName)) || top20RangeKeyFromText(fileName);
 
   function valueAt(row, c){ return (c>=0 && c<row.length) ? row[c] : null; }
   function cleanText(v){
     const t = safeStr(v).trim();
     if (!t) return '';
-    if (/^(月別|排序|排名|序號|半成品|半成品名稱|商品名|商品名稱|單價|報廢金額|超用金額|原因說明|後續對策|備註商品名稱)$/.test(t)) return '';
+    if (/^(月別|日期|排序|排名|序號|半成品|半成品名稱|商品名|商品名稱|單價|報廢金額|超用金額|原因說明|其他原因說明|後續對策|備註商品名稱|備註-商品名稱|總件數|金額|比例|占比)$/.test(t)) return '';
     return t;
   }
-  function isBadProductName(t){
+  function isBadTop20Text(t){
     const x = safeStr(t).trim();
     if (!x) return true;
+    if (x === '-' || x === '—') return true;
     if (/^\d+(\.\d+)?$/.test(x)) return true;
     if (/^NT\$?\s*\d/i.test(x)) return true;
-    if (['原因說明','後續對策','分析原因','半成品名稱','單價','月別','排序'].includes(x)) return true;
+    if (['原因說明','其他原因說明','後續對策','分析原因','半成品名稱','單價','月別','日期','排序','排名','序號','總件數','金額','比例','占比'].includes(x)) return true;
     return false;
   }
-  function detectProductCol(rows, startRow){
-    const candidates = [];
-    const maxC = Math.max(...rows.slice(0, Math.min(rows.length, 10)).map(r=>(r||[]).length), 0);
-    for (let c=0; c<maxC; c++){
-      let score = 0;
-      for (let r=Math.max(0,startRow); r<Math.min(rows.length, startRow+35); r++){
-        const v = cleanText((rows[r]||[])[c]);
-        if (!v || isBadProductName(v)) continue;
-        const h = normKey(v);
-        if (h.includes('備註商品名稱') || h.includes('商品名稱')) score += 6;
-        if (c >= 20) score += 2; // 新版表多數商品名在右側備註欄
-        if (/[\u4e00-\u9fff]/.test(v)) score += 1;
-      }
-      if (score>0) candidates.push([score,c]);
-    }
-    candidates.sort((a,b)=>b[0]-a[0]);
-    return candidates.length ? candidates[0][1] : -1;
+  function reasonKeyFromValue(v){
+    const k = normalizeReasonKey(v);
+    return reasonKeys.has(k) ? k : '';
+  }
+  function parseTop20DateOrRange(v){
+    const rk = top20RangeKeyFromText(v);
+    if (rk) return {rangeKey: rk, monthKey: monthKeyFromRangeKey(rk, fileName)};
+    const d = parseMaybeDate(v);
+    if (d instanceof Date && !isNaN(d)) return {rangeKey: null, monthKey: monthKeyFromDateObj(d)};
+    return {rangeKey: null, monthKey: null};
   }
 
   const out = [];
@@ -1850,116 +1844,76 @@ function parseTop20FromWB(wb, fileName){
     const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null, raw:true});
     if (!rows || !rows.length) continue;
 
-    // 新豐 5月後 JFM 前20大版面欄位固定，但合併儲存格會讓模糊表頭誤抓。
-    // 固定欄位優先：B 月別、D 排序、E 半成品、F 金額、G 單價、W 分析原因、X 原因說明、Y 後續對策、Z 次數、AA 備註商品名稱。
-    // 新豐 2026/05 以後前20大固定欄位（0-based）：
-    // B 月別、D 排序、E 半成品、F 金額、L 單價、U 分析原因、V 原因說明、W 後續對策、X 次數、Y 備註商品名稱。
-    // 原程式將單價/原因/商品欄位往後偏移，會造成商品名顯示成「週前二十」或金額、半成品名顯示成數字。
-    const FIX = { month:1, sort:3, semi:4, amt:5, unit:11, reason:20, desc:21, act:22, times:23, product:24 };
+    let lastRangeKey = fileRangeKey || null;
+    let lastMonthKey = fileRangeKey ? monthKeyFromRangeKey(fileRangeKey, fileName) : null;
 
-    const headerRows = Math.min(10, rows.length);
-    const maxC = Math.max(...rows.slice(0, headerRows).map(r => (r || []).length), 0);
-    const colLabels = new Array(maxC).fill('');
-    for (let c=0; c<maxC; c++){
-      const parts=[];
-      for (let r=0;r<headerRows;r++){
-        const v=normCell((rows[r]||[])[c]);
-        if(v) parts.push(v);
-      }
-      colLabels[c]=parts.join('|');
-    }
-    const findCol = (needList, excludeList=[])=>{
-      let best=-1, bestScore=-1;
-      for (let c=0;c<colLabels.length;c++){
-        const h=normKey(colLabels[c]);
-        if(!h) continue;
-        if(excludeList.some(ex=>normKey(ex) && h.includes(normKey(ex)))) continue;
-        for(const n of needList){
-          const nn=normKey(n); if(!nn) continue;
-          if(h===nn) return c;
-          if(h.includes(nn) && nn.length>bestScore){ bestScore=nn.length; best=c; }
-        }
-      }
-      return best;
-    };
-
-    // 仍保留表頭偵測作為舊版 fallback。
-    const cMonthH = findCol(['月別']);
-    const cSortH  = findCol(['排序','排名','序號']);
-    const cSemiH  = findCol(['半成品名稱','半成品名','半成品'], ['商品']);
-    const cAmtH   = (kind==='scrap') ? findCol(['報廢金額']) : findCol(['超用金額']);
-    const cUnitH  = findCol(['半成品單價','單價']);
-    let cReasonH  = findCol(['分析原因'], ['分析原因件','總件數']);
-    if (cReasonH < 0) cReasonH = findCol(['原因別','原因分類']);
-    const cDescH  = findCol(['原因說明']);
-    const cActH   = findCol(['後續對策','對策']);
-    const cProductH = findCol(['備註商品名稱','備註-商品名稱','備註商品名','商品名稱','商品名','商品'], ['半成品','分析原因','分析原因件','原因說明','後續對策','單價','金額','排序','排名','序號']);
-
-    // 如果固定欄看起來有效，就用固定欄；否則用偵測欄。
-    const fixedEvidence = rows.slice(0, Math.min(rows.length, 80)).some(row => {
-      const semi = cleanText(valueAt(row, FIX.semi));
-      const amt = asNumber(valueAt(row, FIX.amt));
-      const reason = normalizeReasonKey(valueAt(row, FIX.reason));
-      return !!semi && Number.isFinite(amt) && (Math.abs(amt)>0) && !!reason;
-    });
-    const cMonth = fixedEvidence ? FIX.month : cMonthH;
-    const cSort  = fixedEvidence ? FIX.sort  : cSortH;
-    const cSemi  = fixedEvidence ? FIX.semi  : cSemiH;
-    const cAmt   = fixedEvidence ? FIX.amt   : cAmtH;
-    const cUnit  = fixedEvidence ? FIX.unit  : cUnitH;
-    const cReason= fixedEvidence ? FIX.reason: cReasonH;
-    const cDesc  = fixedEvidence ? FIX.desc  : cDescH;
-    const cAct   = fixedEvidence ? FIX.act   : cActH;
-    let cProduct = fixedEvidence ? FIX.product : cProductH;
-    if (!fixedEvidence && cProduct < 0) cProduct = detectProductCol(rows, 0);
-
-    let lastRangeKey = null;
-    let lastProduct = '';
     for (let r=0; r<rows.length; r++){
       const row = rows[r] || [];
-      const rowRangeKey = top20RangeKeyFromText(valueAt(row, cMonth));
-      if (rowRangeKey) lastRangeKey = rowRangeKey;
-      // 週檔內 B 欄「月別」常殘留舊週別（例如 1202-1208），
-      // 因此前20大週別一律優先採用檔名解析出的區間。
-      const rangeKey = fileRangeKey || rowRangeKey || lastRangeKey || null;
 
-      const sortVal = asNumber(valueAt(row, cSort));
-      const semi = cleanText(valueAt(row, cSemi));
-      let productRaw = cleanText(valueAt(row, cProduct));
-      if (!isBadProductName(productRaw)) lastProduct = productRaw;
-      else productRaw = '';
+      // B 欄是週別/月別/日期，合併儲存格時只有每段第一列有值，需向下延用。
+      const markerInfo = parseTop20DateOrRange(valueAt(row, 1));
+      if (markerInfo.rangeKey) {
+        lastRangeKey = markerInfo.rangeKey;
+        lastMonthKey = markerInfo.monthKey || lastMonthKey;
+      } else if (markerInfo.monthKey) {
+        lastMonthKey = markerInfo.monthKey;
+      }
+      const rangeKey = lastRangeKey || fileRangeKey || null;
+      const monthKey = lastMonthKey || (rangeKey ? monthKeyFromRangeKey(rangeKey, fileName) : inferMonthKeyFromFileName(fileName));
 
-      const reason = cleanText(valueAt(row, cReason));
-      const reasonKey = normalizeReasonKey(reason);
-      const desc = cleanText(valueAt(row, cDesc));
-      const act  = cleanText(valueAt(row, cAct));
-      const amt = asNumber(valueAt(row, cAmt));
-      const unitPrice = asNumber(valueAt(row, cUnit));
-      const times = asNumber(valueAt(row, FIX.times));
-
+      const sortVal = asNumber(valueAt(row, 3));       // D 排序
+      const semi = cleanText(valueAt(row, 4));          // E 半成品名稱
+      const amt = asNumber(valueAt(row, 5));            // F 報廢/超用金額
       const hasRank = Number.isFinite(sortVal) && sortVal >= 1 && sortVal <= 20;
-      const hasAmount = Number.isFinite(amt) && Math.abs(amt) > 0;
-      const hasContent = !!(semi || productRaw || reason || desc || act);
-      if (!hasRank && !(hasAmount && hasContent)) continue;
-      if (!hasAmount || !hasContent) continue;
-      if (!semi && !productRaw) continue;
+      if (!hasRank) continue;
+      if (!semi || isBadTop20Text(semi)) continue;
+      if (!Number.isFinite(amt) || Math.abs(amt) <= 0) continue;
+
+      // 2026/05 後新格式：G=單價, W=分析原因, X=原因說明, Y=後續對策, Z=次數, AA=備註商品名稱
+      // 舊格式：L=單價, U=分析原因, V=原因說明, W=後續對策, X=次數, Y=備註商品名稱
+      const newReasonKey = reasonKeyFromValue(valueAt(row, 22)); // W
+      const oldReasonKey = reasonKeyFromValue(valueAt(row, 20)); // U
+      let layout = null;
+      if (newReasonKey) layout = 'new';
+      else if (oldReasonKey) layout = 'old';
+      else continue;
+
+      const reasonCol = layout === 'new' ? 22 : 20;
+      const descCol   = layout === 'new' ? 23 : 21;
+      const actCol    = layout === 'new' ? 24 : 22;
+      const timesCol  = layout === 'new' ? 25 : 23;
+      const prodCol   = layout === 'new' ? 26 : 24;
+      const unitCol   = layout === 'new' ? 6  : 11;
+      const categoryCol = layout === 'new' ? 21 : 19;
+
+      const reason = cleanText(valueAt(row, reasonCol));
+      const reasonKey = reasonKeyFromValue(reason);
       if (!reasonKey) continue;
+
+      let product = cleanText(valueAt(row, prodCol));
+      if (isBadTop20Text(product)) product = '';
+
+      const unitPrice = asNumber(valueAt(row, unitCol));
+      const times = asNumber(valueAt(row, timesCol));
+      const category = cleanText(valueAt(row, categoryCol));
 
       out.push({
         kind,
         rangeKey: normRangeKey(rangeKey),
-        monthKey: rangeKey ? monthKeyFromRangeKey(rangeKey, fileName) : inferMonthKeyFromFileName(fileName),
+        monthKey,
         reason,
         reasonKey,
-        product: productRaw || lastProduct || '',
+        category,
+        product,
         semi,
         unitPrice: Number.isFinite(unitPrice) ? unitPrice : null,
         amt: Number.isFinite(amt) ? amt : 0,
-        desc,
-        act,
+        desc: cleanText(valueAt(row, descCol)),
+        act: cleanText(valueAt(row, actCol)),
         times: Number.isFinite(times) ? times : null,
         source: safeStr(fileName),
-        year: fileYear
+        year: fileYear,
+        layout
       });
     }
   }
@@ -2927,7 +2881,9 @@ function parseReasonFromWB(wb, fileName){
           year: String(info.year||fileYear||''),
           reason: label,
           scrapAmt: findNearbyAmount(r, c, 'scrap'),
+          scrapPct: null,
           overuseAmt: findNearbyAmount(r, c, 'over'),
+          overusePct: null,
           scrapPct: findNearbyPct(r, c, 'scrap'),
           overusePct: findNearbyPct(r, c, 'over'),
           source: safeStr(fileName)
@@ -3023,7 +2979,9 @@ function parseReasonFromWB(wb, fileName){
           year: String(info.year||''),
           reason: labels[i],
           scrapAmt: cellNum(rS, cA),
+          scrapPct: cellNum(rS, cA+1),
           overuseAmt: cellNum(rO, cA),
+          overusePct: cellNum(rO, cA+1),
           scrapPct: normalizeExcelRate((rows[rS]||[])[cA+1]),
           overusePct: normalizeExcelRate((rows[rO]||[])[cA+1]),
           source: safeStr(fileName)
@@ -3033,13 +2991,11 @@ function parseReasonFromWB(wb, fileName){
   }
 
   const fixedTotal = out.reduce((a,b)=>a+(Number(b.scrapAmt)||0)+(Number(b.overuseAmt)||0),0);
+  // 固定版面是 JFM 7-1 原因別分析的正式欄位（F/H/J/L 為金額、右側一欄為比例）。
+  // 動態掃描只作為完全抓不到固定版面時的備援；不能用動態結果覆蓋固定結果，否則會把比例欄或下方彙總欄誤判為其他原因。
+  if (fixedTotal > 0) return out;
   const dyn = parseReasonDynamicRows();
-  const dynTotal = dyn.reduce((a,b)=>a+(Number(b.scrapAmt)||0)+(Number(b.overuseAmt)||0),0);
-  const dynReasonCount = new Set(dyn.map(x => normalizeReasonKey(x.reason)).filter(Boolean)).size;
-  // 新豐 5月後 7-1 表格欄位有偏移，固定 F/H/J/L 位置可能抓到錯欄。
-  // 只要動態掃描能抓到多個原因且有金額，就以動態結果為準。
-  if (dyn.length && dynTotal > 0 && dynReasonCount >= 2) return dyn;
-  if (dyn.length && fixedTotal === 0) return dyn;
+  if (dyn.length) return dyn;
   return out;
 }
 
@@ -3969,9 +3925,9 @@ function renderReasonCards(rangeStartISO, rangeEndISO){
       if (!picked.length && monthKey) picked = entries.filter(r => r.monthKey === monthKey || rangeKeyTouchesMonth(normRangeKey(r.rangeKey), monthKey));
     }
 
-    // 若來源檔已被 activeJfmSources 篩到，但解析不到 rangeKey/monthKey（常見於 7-1 標題無日期），
-    // 直接採用該來源檔內的原因別資料，避免畫面全部顯示 0。
-    if (!picked.length && actSrc.length) picked = entries;
+    // 週別必須精準對應檔名/區間；若沒有該週 7-1 資料，不可退回顯示其他週。
+    // 月別/年別若來源檔缺少區間資訊，才允許採用 active source 作為備援。
+    if (!picked.length && actSrc.length && state.mode !== 'week') picked = entries;
 
     const mapReasonToKey = (txt) => {
       const k = normalizeReasonKey(txt);
@@ -5742,6 +5698,13 @@ function resolveTop20DisplayPair(r, kind){
     semi: safeStr(r?.semi || '').trim(),
     unitPrice: (r && r.unitPrice != null && isFinite(r.unitPrice)) ? Number(r.unitPrice) : null
   };
+
+  const badName = (x) => {
+    const t = safeStr(x).trim();
+    return !t || t === '-' || t === '—' || /^\d+(\.\d+)?$/.test(t);
+  };
+  // JFM 前二十大表本身已有商品名/半成品/單價時，以 JFM 為準，避免用日報明細反查時被錯位資料覆蓋。
+  if (!badName(fallback.product) && !badName(fallback.semi) && Number.isFinite(Number(fallback.unitPrice))) return fallback;
 
   const semiKey = normKey(fallback.semi);
   const detailSources = [].concat(Array.isArray(state.halfDetails) ? state.halfDetails : [], Array.isArray(state.details) ? state.details : []);
