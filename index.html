@@ -3112,7 +3112,17 @@ function computeNeededMonthKeysFromUI(){
   if (mode === 'week') {
     const ws = $('weekSel') ? $('weekSel').value : state.selection.weekStart;
     const w = (state.weeks || []).find(x => x.start === ws);
-    return w ? monthKeysBetween(w.start, w.end) : ((y && m) ? [`${y}-${m}`] : []);
+    if (w && w.start && w.end) return monthKeysBetween(w.start, w.end);
+
+    // 週別下拉有時只保存起始日；跨月週別不能退回只載入 monthSel，
+    // 必須直接用週起始日 + 6 天推算完整期間，確保 05/26~06/01 會同時載入 5 月與 6 月檔案。
+    const ds = parseISO(ws);
+    if (ds instanceof Date && !isNaN(ds)) {
+      const startISO = toISO(ds);
+      const endISO = toISO(addDays(ds, 6));
+      return monthKeysBetween(startISO, endISO);
+    }
+    return (y && m) ? [`${y}-${m}`] : [];
   }
   if (mode === 'day') {
     const d = $('daySel') ? $('daySel').value : state.selection.day;
@@ -3162,9 +3172,42 @@ function setDefaultSelectionToLatestLoadedMonth(monthKeys){
   state.selection.end = toISO(new Date(yy, mo, 0));
 }
 
+function summaryCompletenessScore(r){
+  if (!r) return -1;
+  const core = ['sales','scrapAmt','scrapRate','overuseAmt','overuseRate'];
+  return core.reduce((score, k) => {
+    const v = Number(r[k]);
+    return score + (Number.isFinite(v) && Math.abs(v) > 0 ? 1 : 0);
+  }, 0);
+}
+
+function mergeSummaryRows(oldRow, newRow){
+  if (!oldRow) return newRow;
+  if (!newRow) return oldRow;
+
+  // 跨月週別會同時讀到兩個月份檔；月初檔常保留上月日期的空白列。
+  // 同一天重複時，以營業額／報廢／超用較完整的那筆為主，避免被空白列覆蓋。
+  const oldScore = summaryCompletenessScore(oldRow);
+  const newScore = summaryCompletenessScore(newRow);
+  if (newScore > oldScore) return Object.assign({}, oldRow, newRow);
+  if (newScore < oldScore) return oldRow;
+
+  const merged = Object.assign({}, oldRow);
+  for (const [k, v] of Object.entries(newRow)){
+    if (k === 'date') continue;
+    const nv = Number(v);
+    const ov = Number(merged[k]);
+    if ((!Number.isFinite(ov) || Math.abs(ov) === 0) && Number.isFinite(nv) && Math.abs(nv) > 0) merged[k] = v;
+  }
+  return merged;
+}
+
 function dedupeLoadedData(){
   const sm = new Map();
-  for (const r of (state.summary||[])) sm.set(r.date, r);
+  for (const r of (state.summary||[])) {
+    if (!r || !r.date) continue;
+    sm.set(r.date, mergeSummaryRows(sm.get(r.date), r));
+  }
   state.summary = Array.from(sm.values()).sort((a,b)=>safeLocaleCompare(a.date,b.date));
 
   state.details = (state.details||[]).sort((a,b)=>safeLocaleCompare(a.date,b.date));
@@ -3262,8 +3305,14 @@ async function ensureDataForMonthKeys(monthKeys){
 
 async function ensureDataForCurrentSelection(){
   const keys = computeNeededMonthKeysFromUI();
-  if (!keys.length) return;
-  await ensureDataForMonthKeys(keys);
+  try{
+    const r = getDateRange();
+    const prev = (typeof computePreviousDetailRange === 'function') ? computePreviousDetailRange(r.start, r.end) : null;
+    if (prev && prev.start && prev.end) keys.push(...monthKeysBetween(prev.start, prev.end));
+  }catch(e){}
+  const uniq = Array.from(new Set(keys.filter(Boolean)));
+  if (!uniq.length) return;
+  await ensureDataForMonthKeys(uniq);
 }
 
 async function loadAllData() {
