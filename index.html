@@ -2304,18 +2304,56 @@ function findNewHeaderRow(aoa){
   return -1;
 }
 
+
+function detailSheetNameToISO(sheetName, yearHint){
+  const n = String(sheetName || '').replace(/\s+/g, '');
+  const toISOFromYMDLocal = (y, mo, d) => {
+    if (!y || !mo || !d) return null;
+    const dt = new Date(Number(y), Number(mo) - 1, Number(d));
+    if (!(dt instanceof Date) || isNaN(dt)) return null;
+    return toISO(dt);
+  };
+  let m = n.match(/^(\d{2})[\/-]?(\d{2})(?:合計)?$/);
+  if (m && yearHint) return toISOFromYMDLocal(yearHint, m[1], m[2]);
+  m = n.match(/^合計(\d{2})[\/-]?(\d{2})$/);
+  if (m && yearHint) return toISOFromYMDLocal(yearHint, m[1], m[2]);
+  m = n.match(/^合計(\d{4})$/);
+  if (m && yearHint) return toISOFromYMDLocal(yearHint, m[1].slice(0,2), m[1].slice(2,4));
+  m = n.match(/^(20\d{2})[\/-](\d{2})[\/-](\d{2})(?:.*合計)?$/);
+  if (m) return toISOFromYMDLocal(m[1], m[2], m[3]);
+  return null;
+}
+
+function isDetailDataSheetExcluded(sheetName){
+  const n = String(sheetName || '').replace(/\s+/g, '');
+  return /分析日報|各日合計|日別報廢率總表|報廢率總表|前10名|前十名|共用類|KPI|名詞定義|下拉式選單|空白/i.test(n);
+}
+
+function selectDetailCandidateSheetNames(wb, yearHint){
+  const names = (wb.SheetNames || []).map(s => String(s || ''));
+  const isDailyTotal = (sn) => {
+    const n = sn.replace(/\s+/g, '');
+    return !isDetailDataSheetExcluded(sn) && n.includes('合計') && !!detailSheetNameToISO(sn, yearHint);
+  };
+  const dailyTotalSheets = names.filter(isDailyTotal);
+  // 若檔案同時有「0501-31合計」與「0531合計」這類每日合計分頁，
+  // 只讀每日合計，避免同一天被月合計、日合計、分析日報重複加總。
+  if (dailyTotalSheets.length) return dailyTotalSheets;
+
+  // 舊檔若只有月合計/單一合計表，才退回讀合計表；仍排除分析日報與前10名等輔助分頁。
+  return names.filter(sn => {
+    if (isDetailDataSheetExcluded(sn)) return false;
+    const n = sn.replace(/\s+/g, '');
+    return n.includes('合計') || !!detailSheetNameToISO(sn, yearHint);
+  });
+}
+
 function parseHalfDetailsFromWB(wb, fileName){
   // 2026/05 以後的新格式常改為「半成品生產管理日報」與「xx合計」分頁；
   // 這裡用更彈性的表頭定位補強半成品展開、日別明細與 KPI 派生計算。
   const out = [];
   const yearHint = parseLocalFileYearHint(fileName);
-  const sheetNames = (wb.SheetNames || []).map(s => String(s || ''));
-  const sumSheets = sheetNames.filter(s => {
-    const n = s.replace(/\s+/g,'');
-    if (!n.includes('合計') && !n.includes('分析日報')) return false;
-    if (/各日合計|日別報廢率總表|報廢率總表|前10名|共用類|KPI|名詞定義|下拉式選單|空白/i.test(n)) return false;
-    return true;
-  });
+  const sumSheets = selectDetailCandidateSheetNames(wb, yearHint);
 
   const findColBy = (labels, predicate) => {
     for (let i=0; i<labels.length; i++){
@@ -2334,6 +2372,7 @@ function parseHalfDetailsFromWB(wb, fileName){
   };
 
   for (const sname of sumSheets){
+    const fixedISO = detailSheetNameToISO(sname, yearHint);
     const ws = wb.Sheets[sname];
     if (!ws) continue;
     const aoa = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null});
@@ -2405,9 +2444,9 @@ function parseHalfDetailsFromWB(wb, fileName){
 
     for (let r=dataStart; r<aoa.length; r++){
       const row = aoa[r] || [];
-      const dt = parseDateWithYearHint(cDate >= 0 ? row[cDate] : row[0], yearHint) || parseDateWithYearHint(row[0], yearHint);
-      if (!dt) continue;
-      const date = toISO(dt);
+      const dt = fixedISO ? parseISO(fixedISO) : (parseDateWithYearHint(cDate >= 0 ? row[cDate] : row[0], yearHint) || parseDateWithYearHint(row[0], yearHint));
+      if (!dt && !fixedISO) continue;
+      const date = fixedISO || toISO(dt);
       const product = safeStr(row[cProduct]).trim();
       const semi = safeStr(row[cSemi]).trim();
       if (!product && !semi) continue;
@@ -2705,13 +2744,8 @@ function parseDetailsFromWB(wb, fileNameOrMeta) {
     return rows;
   }
 
-  const candidateSheets = wb.SheetNames
-    .filter(sn => {
-      const n = String(sn || '').replace(/\s+/g, '');
-      if (/各日合計|日別報廢率總表|報廢率總表|前10名|共用類|KPI|名詞定義|下拉式選單|空白/i.test(n)) return false;
-      return n.includes('合計') || n.includes('分析日報') || !!sheetNameToISO(sn);
-    })
-    .map(sn => ({ sn, fixedISO: sheetNameToISO(sn) }));
+  const candidateSheets = selectDetailCandidateSheetNames(wb, yearHint)
+    .map(sn => ({ sn, fixedISO: detailSheetNameToISO(sn, yearHint) }));
 
   for (const { sn, fixedISO } of candidateSheets) {
     const ws = wb.Sheets[sn];
@@ -5592,7 +5626,7 @@ function renderDetailTable(daily) {
         <td class="mono">${shortLabel(r.date)}</td>
         <td>${r.product}</td>
         <td class="muted">${r.semi}</td>
-        <td class="text-right mono">${r.price==null?'—':fmtMoney(r.price).replace('NT$ ','')}</td>
+        <td class="text-right mono">${r.price==null?'—':fmtUnitPrice(r.price)}</td>
         <td class="text-right mono">${fmtQtyValue(r.order)}</td>
         <td class="text-right mono">${fmtQtyRateByOrder(r.expandQty, r.order, r.expandRate)}</td>
         <td class="text-right mono">${fmtQtyRateByOrder(r.actualQty, r.order, r.actualRate)}</td>
@@ -5605,7 +5639,7 @@ function renderDetailTable(daily) {
         <td class="mono">${shortLabel(r.date)}</td>
         <td>${r.product}</td>
         <td class="muted">${r.semi}</td>
-        <td class="text-right mono">${r.price==null?'—':fmtMoney(r.price).replace('NT$ ','')}</td>
+        <td class="text-right mono">${r.price==null?'—':fmtUnitPrice(r.price)}</td>
         <td class="text-right mono">${fmtQtyValue(r.order)}</td>
         <td class="text-right mono">${fmtOutputQtyRate(r)}</td>
         <td class="text-right mono">${fmtQtyRateByOrder(r.scrapQty, r.order, r.scrapRate)}</td>
@@ -5622,7 +5656,7 @@ function renderDetailTable(daily) {
         <td class="text-right mono">${fmtQtyValue(r.order)}</td>
         <td class="text-right mono">${fmtInt(r.output)}</td>
         <td class="text-right mono">${fmtInt(r.refill)}</td>
-        <td class="text-right mono">${r.price==null?'—':fmtMoney(r.price).replace('NT$ ','')}</td>
+        <td class="text-right mono">${r.price==null?'—':fmtUnitPrice(r.price)}</td>
         <td class="text-right mono">${r.prodRate==null?'—':fmtPct(r.prodRate)}</td>
         <td class="text-right mono">${fmtQtyRateByOrder(r.diffQty, r.order)}</td>
         <td class="text-right mono">${fmtMoney(r.diffAmt)}</td>
