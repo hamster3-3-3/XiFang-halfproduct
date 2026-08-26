@@ -4885,7 +4885,7 @@ function renderAll() {
   bindReasonCardClicks();
   renderKPIChart(augSummaryChart, start, end);
   renderRightChart(augSummaryChart, start, end);
-  applyGroupFilterAndRender(drowsChart);
+  applyGroupFilterAndRender(drows);
 }
 
 function renderKPIOnly() {
@@ -5015,13 +5015,9 @@ function renderSelectedItem() {
   }
   const {start, end} = getDateRange();
 
-  // 月別：趨勢圖需納入跨月週（只要週區間與該月有交集，就計入整週資料）
-  let chartStart = start, chartEnd = end;
-  if (state.mode === 'month') {
-    const ex = expandToWholeWeeks(start, end);
-    chartStart = ex.start;
-    chartEnd = ex.end;
-  }
+  // 半成品展開的商品趨勢／明細同樣使用嚴格選取區間。
+  // 月別固定為該月 1 日～月末，不延伸到跨月週。
+  const chartStart = start, chartEnd = end;
 
   const sourceRows = getDetailSourceRowsForChart(chartStart, chartEnd);
 
@@ -5029,7 +5025,7 @@ function renderSelectedItem() {
   const drowsBase = filterByRange(sourceRows, start, end)
     .filter(r => (r.product + '||' + r.semi) === state.selectedKey);
 
-  // 趨勢圖：使用擴展後區間
+  // 趨勢圖：使用與半成品展開相同的嚴格選取區間
   const drowsChart = filterByRange(sourceRows, chartStart, chartEnd)
     .filter(r => (r.product + '||' + r.semi) === state.selectedKey);
   if (!drowsBase.length && !drowsChart.length) {
