@@ -1,0 +1,13 @@
+{
+  "name": "xifang-halfproduct-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "新豐廠半成品儀表板 Excel 轉 JSON 工具",
+  "scripts": {
+    "convert:data": "node scripts/convert.cjs",
+    "check:data": "node scripts/convert.cjs --check"
+  },
+  "dependencies": {
+    "xlsx": "0.18.5"
+  }
+}

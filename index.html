@@ -484,7 +484,6 @@ function monthKeyFromISO(iso){
 </style>
 
   <!-- Local vendor scripts (GitHub Pages 同網域) -->
-  <script src="./xlsx.full.min.js"></script>
   <script src="./chart.umd.min.js"></script>
 </head>
 
@@ -1246,6 +1245,7 @@ async function tryLoadLaunchMap(){
     try{
       const r = await fetchWithTimeout(url, {cache:'no-store'}, 20000);
       if (!r.ok) throw new Error('HTTP ' + r.status);
+      await ensureXlsxReady();
       const ab = await r.arrayBuffer();
       const wb = XLSX.read(ab, {type:'array', cellDates:true});
       const mp = parseLaunchMapFromWB(wb);
@@ -1368,6 +1368,78 @@ function fetchWithTimeout(url, options={}, timeoutMs=20000){
   const timer = setTimeout(() => controller.abort(new DOMException('timeout','AbortError')), timeoutMs);
   const opts = Object.assign({}, options, { signal: controller.signal });
   return fetch(url, opts).finally(() => clearTimeout(timer));
+}
+
+let jsonManifest = {files:{}};
+const dashboardPayloadCache = new Map();
+let xlsxReadyPromise = null;
+
+function ensureXlsxReady(){
+  if (!xlsxReadyPromise) {
+    xlsxReadyPromise = ensureLibGlobal('XLSX', [
+      './xlsx.full.min.js',
+      'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js'
+    ]).catch(err => {
+      xlsxReadyPromise = null;
+      throw err;
+    });
+  }
+  return xlsxReadyPromise;
+}
+
+async function loadJsonManifest(){
+  try{
+    const r = await fetchWithTimeout('./data/json-manifest.json', {cache:'no-store'}, 10000);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    if (j && j.files && typeof j.files === 'object') jsonManifest = j;
+  }catch(e){
+    console.warn('JSON 索引讀取失敗，將於需要時改讀 Excel', e);
+    jsonManifest = {files:{}};
+  }
+}
+
+async function readDashboardPayload(file){
+  if (dashboardPayloadCache.has(file)) return dashboardPayloadCache.get(file);
+
+  const task = (async () => {
+    const entry = jsonManifest?.files?.[file];
+    if (entry?.json) {
+      try{
+        const version = encodeURIComponent(`${entry.sourceSha256 || ''}-${entry.parserHash || ''}`);
+        const url = './' + encodePath(entry.json) + '?v=' + version;
+        const r = await fetchWithTimeout(url, {cache:'force-cache'}, 20000);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const payload = await r.json();
+        if (entry.sourceSha256 && payload.sourceSha256 !== entry.sourceSha256) throw new Error('來源雜湊不符');
+        if (entry.parserHash && payload.parserHash !== entry.parserHash) throw new Error('解析器版本不符');
+        return payload;
+      }catch(e){
+        console.warn('JSON 讀取失敗，改讀 Excel：' + file, e);
+      }
+    }
+
+    await ensureXlsxReady();
+    const url = './data/' + encodePath(file);
+    const r = await fetchWithTimeout(url, {cache:'no-store'}, 20000);
+    if (!r.ok) throw new Error('讀取失敗：' + file);
+    const wb = XLSX.read(await r.arrayBuffer(), {type:'array', cellDates:true});
+    if (isWasteFile(file)) {
+      return {
+        summary: parseSummaryFromWB(wb, file),
+        details: parseDetailsFromWB(wb, file),
+        halfDetails: parseHalfDetailsFromWB(wb, file)
+      };
+    }
+    return {
+      reasonWeeks: parseReasonFromWB(wb, file),
+      top20Entries: parseTop20FromWB(wb, file)
+    };
+  })();
+
+  dashboardPayloadCache.set(file, task);
+  try { return await task; }
+  catch (e) { dashboardPayloadCache.delete(file); throw e; }
 }
 
 async function loadManifest() {
@@ -3463,22 +3535,14 @@ async function ensureDataForMonthKeys(monthKeys, options={}){
   for (let __loadIdx = 0; __loadIdx < files.length; __loadIdx++) {
     const f = files[__loadIdx];
     try {
-      const url = './data/' + encodePath(f);
+      const payload = await readDashboardPayload(f);
       if (isWasteFile(f)) {
-        const r = await fetchWithTimeout(url, {cache:'no-store'}, 20000);
-        if (!r.ok) throw new Error('讀取失敗：' + f);
-        const ab = await r.arrayBuffer();
-        const wb = XLSX.read(ab, {type:'array', cellDates:true});
-        sum = sum.concat(parseSummaryFromWB(wb, f));
-        det = det.concat(parseDetailsFromWB(wb, f));
-        halfDet = halfDet.concat(parseHalfDetailsFromWB(wb, f));
+        sum = sum.concat(payload.summary || []);
+        det = det.concat(payload.details || []);
+        halfDet = halfDet.concat(payload.halfDetails || []);
       } else if (isJfmFile(f)) {
-        const r = await fetchWithTimeout(url, {cache:'no-store'}, 20000);
-        if (!r.ok) throw new Error('讀取失敗：' + f);
-        const ab = await r.arrayBuffer();
-        const wb = XLSX.read(ab, {type:'array', cellDates:true});
-        reasons = reasons.concat(parseReasonFromWB(wb, f));
-        top20 = top20.concat(parseTop20FromWB(wb, f));
+        reasons = reasons.concat(payload.reasonWeeks || []);
+        top20 = top20.concat(payload.top20Entries || []);
         if (state.loadedJfmFiles && typeof state.loadedJfmFiles.add === 'function') state.loadedJfmFiles.add(f);
       }
     } catch (e) {
@@ -3532,10 +3596,7 @@ async function loadAllData() {
   $('dataStatus').classList.remove('chip');
   $('dataStatus').classList.add('chip');
 
-  await ensureLibGlobal('XLSX', [
-    './xlsx.full.min.js',
-    'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js'
-  ]);
+  await loadJsonManifest();
   await ensureLibGlobal('Chart', [
     './chart.umd.min.js',
     'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js',
@@ -5986,13 +6047,9 @@ async function loadJfmSourcesForTop20(files){
   const errors = [];
   for (const f of need){
     try{
-      const url = './data/' + encodePath(f);
-      const r = await fetchWithTimeout(url, {cache:'no-store'}, 20000);
-      if (!r.ok) throw new Error('HTTP ' + r.status + '：' + f);
-      const ab = await r.arrayBuffer();
-      const wb = XLSX.read(ab, {type:'array', cellDates:true});
-      reasons = reasons.concat(parseReasonFromWB(wb, f));
-      top20 = top20.concat(parseTop20FromWB(wb, f));
+      const payload = await readDashboardPayload(f);
+      reasons = reasons.concat(payload.reasonWeeks || []);
+      top20 = top20.concat(payload.top20Entries || []);
       state.loadedJfmFiles.add(f);
     }catch(e){
       console.warn('[Top20 補載失敗]', e);
