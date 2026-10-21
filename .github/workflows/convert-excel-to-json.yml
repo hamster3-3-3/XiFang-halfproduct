@@ -1,37 +1,45 @@
-name: Convert Excel to JSON
+name: Convert Excel to JSON and Deploy Website
 
 on:
   push:
     branches: [main, master]
-    paths:
-      - "data/**/*.xlsx"
-      - "scripts/convert.cjs"
-      - "index.html"
-      - "package.json"
-      - "package-lock.json"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: excel-json-${{ github.ref }}
+  group: excel-json-pages-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   convert:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-      - run: npm ci
-      - run: npm run convert:data
-      - run: npm run check:data
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Convert Excel to JSON
+        run: npm run convert:data
+
+      - name: Validate generated data
+        run: npm run check:data
+
       - name: Commit generated JSON
         run: |
           git config user.name "github-actions[bot]"
@@ -44,3 +52,37 @@ jobs:
             git pull --rebase origin "${GITHUB_REF_NAME}"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
+
+      # Recheck after rebasing: never publish a mixture of new Excel and old JSON.
+      - name: Validate publication contents
+        run: npm run check:data
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Prepare website files
+        run: |
+          mkdir -p _site
+          rsync -a --exclude='/.git/' --exclude='/.github/' --exclude='/node_modules/' --exclude='/_site/' ./ _site/
+
+      # Package this working directory, which already contains the generated JSON.
+      # Do not check out the original triggering commit again before publishing.
+      - name: Upload website artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: convert
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy website
+        id: deployment
+        uses: actions/deploy-pages@v4
+
