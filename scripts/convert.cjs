@@ -165,9 +165,11 @@ function main() {
         if (fs.existsSync(target)) fs.unlinkSync(target);
       }
     }
-    for (const rel of orphanJson) fs.unlinkSync(path.join(JSON_ROOT, ...rel.split('/')));
+    // A stale file may already have been removed above; missing files are harmless.
+    for (const rel of orphanJson) fs.rmSync(path.join(JSON_ROOT, ...rel.split('/')), {force: true});
   }
   console.log(`${CHECK ? '檢查完成' : '轉換完成'}：${files.length} 份（新轉 ${converted}、沿用 ${reused}）`);
 }
 
 try { main(); } catch (error) { console.error(error.stack || error); process.exitCode = 1; }
+
